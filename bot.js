@@ -646,14 +646,23 @@ async function fetchKick(slug, retry = true) {
     if (!res.ok) { console.error('Kick API error', res.status); return null; }
     const ch = (await res.json()).data?.[0];
     if (!ch) return null;
-    const live = Boolean(ch.stream?.is_live || ch.is_live || ch.livestream?.is_live || ch.livestream);
+    const toBool = (value) => value === true || value === 'true' || value === 1 || value === '1';
+    const live = Boolean(
+      toBool(ch?.stream?.is_live) ||
+      toBool(ch?.is_live) ||
+      toBool(ch?.livestream?.is_live) ||
+      toBool(ch?.livestream?.live) ||
+      (typeof ch?.livestream?.status === 'string' && ch.livestream.status.toLowerCase() === 'live') ||
+      (typeof ch?.status === 'string' && ch.status.toLowerCase() === 'live')
+    );
+
     return {
       live,
-      sessionId: ch.stream?.id ?? ch.livestream?.id ?? ch.livestream?.session_id ?? ch.session_id ?? null,
-      title: ch.stream_title ?? ch.livestream?.session_title ?? ch.title,
-      category: ch.category?.name ?? ch.livestream?.categories?.[0]?.name,
-      thumbnail: ch.stream?.thumbnail ?? ch.livestream?.thumbnail?.src ?? ch.livestream?.thumbnail?.url,
-      viewers: ch.stream?.viewer_count ?? ch.livestream?.viewer_count,
+      sessionId: ch.stream?.id ?? ch.livestream?.id ?? ch.livestream?.session_id ?? ch.livestream?.sessionId ?? ch.session_id ?? null,
+      title: ch.stream_title ?? ch.livestream?.session_title ?? ch.title ?? ch.stream?.title,
+      category: ch.category?.name ?? ch.livestream?.categories?.[0]?.name ?? ch.stream?.category?.name,
+      thumbnail: ch.stream?.thumbnail ?? ch.livestream?.thumbnail?.src ?? ch.livestream?.thumbnail?.url ?? ch.stream?.thumbnail_url,
+      viewers: ch.stream?.viewer_count ?? ch.livestream?.viewer_count ?? ch.stream?.viewerCount ?? ch.livestream?.viewer_count ?? null,
       name: ch.slug ?? slug,
     };
   } catch (e) { console.error('Kick fetch failed', e.message); return null; }
