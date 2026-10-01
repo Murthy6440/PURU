@@ -167,30 +167,38 @@ async function announce(entry, info) {
 }
 
 /* ───────────── checking (shared by the 30s poll AND /recheck) ───────────── */
-// Announce ONLY on offline → live with a new stream key. Returns true if a message was sent.
-async function handleState(entry, isLive, streamKey, buildInfo) {
-  let announced = false;
+// Announce ONLY on offline → live with a new stream key (or when force=true).
+// Returns { announced, error }. If sending fails, state is rolled back so the next check retries.
+async function handleState(entry, isLive, streamKey, buildInfo, force = false) {
   if (isLive) {
     entry.offlineStrikes = 0;
-    if (!entry.live || entry.lastKey !== streamKey) {
-      const isNew = entry.lastKey !== streamKey;
+    const isNew = entry.lastKey !== streamKey;
+    if (isNew || force) {
+      const prev = { live: entry.live, lastKey: entry.lastKey };
       entry.live = true;
       entry.lastKey = streamKey;
       save(); // persist BEFORE sending → a crash/restart can't cause a repeat
-      if (isNew) {
-        try { await announce(entry, buildInfo()); announced = true; }
-        catch (e) { console.error('Announce failed:', e.message); }
+      try {
+        await announce(entry, buildInfo());
+        return { announced: true };
+      } catch (e) {
+        console.error('Announce failed:', e.message);
+        entry.live = prev.live; // roll back so it retries instead of being marked "announced"
+        entry.lastKey = prev.lastKey;
+        save();
+        return { announced: false, error: e.message };
       }
     }
+    if (!entry.live) { entry.live = true; save(); }
   } else if (entry.live) {
     entry.offlineStrikes = (entry.offlineStrikes || 0) + 1;
     if (entry.offlineStrikes >= OFFLINE_STRIKES_TO_RESET) { entry.live = false; save(); }
   }
-  return announced;
+  return { announced: false };
 }
 
-// Checks the given entries once. Returns { results: [{entry, live, announced}], errors: [string] }
-async function checkEntries(entries) {
+// Checks the given entries once. Returns { results: [{entry, live, announced, error}], errors: [string] }
+async function checkEntries(entries, force = false) {
   const results = [];
   const errors = [];
 
@@ -202,14 +210,14 @@ async function checkEntries(entries) {
         const c = data.get(e.username);
         if (!c) { errors.push(`Kick: ${e.display || e.username} not found`); continue; }
         const s = c.stream;
-        const announced = await handleState(e, !!s?.is_live, s?.start_time || String(Date.now()), () => ({
+        const st = await handleState(e, !!s?.is_live, s?.start_time || String(Date.now()), () => ({
           name: e.display || e.username,
           title: c.stream_title,
           category: c.category?.name,
           image: s.thumbnail ? `${s.thumbnail}${s.thumbnail.includes('?') ? '&' : '?'}t=${Date.now()}` : null,
           url: `https://kick.com/${e.username}`,
-        }));
-        results.push({ entry: e, live: !!s?.is_live, announced });
+        }), force);
+        results.push({ entry: e, live: !!s?.is_live, ...st });
       }
     } catch (err) { errors.push(`Kick: ${err.message}`); }
   }
@@ -220,14 +228,14 @@ async function checkEntries(entries) {
       const live = await ytFetchLive([...new Set(ytEntries.map(e => e.channelId))]);
       for (const e of ytEntries) {
         const v = live.get(e.channelId);
-        const announced = await handleState(e, !!v, v?.id, () => ({
+        const st = await handleState(e, !!v, v?.id, () => ({
           name: e.display || e.username,
           title: v.snippet.title,
           avatar: e.avatar,
           image: `https://i.ytimg.com/vi/${v.id}/maxresdefault_live.jpg?t=${Date.now()}`,
           url: `https://www.youtube.com/watch?v=${v.id}`,
-        }));
-        results.push({ entry: e, live: !!v, announced });
+        }), force);
+        results.push({ entry: e, live: !!v, ...st });
       }
     } catch (err) { errors.push(`YouTube: ${err.message}`); }
   }
@@ -236,10 +244,10 @@ async function checkEntries(entries) {
 
 // One check at a time (poll + manual rechecks can never overlap → no duplicate sends)
 let busy = false;
-async function runExclusive(entries) {
+async function runExclusive(entries, force = false) {
   while (busy) await sleep(300);
   busy = true;
-  try { return await checkEntries(entries); } finally { busy = false; }
+  try { return await checkEntries(entries, force); } finally { busy = false; }
 }
 async function poll() {
   if (busy) return; // previous run still going — skip this tick
@@ -269,7 +277,8 @@ const groupCmd = (name, platform) =>
     .addSubcommand(s => s.setName('disable').setDescription('Pause alerts (re-run the add command to resume)')
       .addStringOption(o => userOpt(o, 'Streamer name')))
     .addSubcommand(s => s.setName('recheck').setDescription('Check right now if streamers are live')
-      .addStringOption(o => o.setName('user').setDescription('Streamer name (leave empty to check everyone)')));
+      .addStringOption(o => o.setName('user').setDescription('Streamer name (leave empty to check everyone)'))
+      .addBooleanOption(o => o.setName('force').setDescription('Re-send the announcement even if already announced')));
 
 const commands = [
   addCmd('kickadd', 'Kick', 'Kick username'),
@@ -347,6 +356,7 @@ client.on(Events.InteractionCreate, async i => {
     if (sub === 'recheck') {
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       const input = i.options.getString('user');
+      const force = i.options.getBoolean('force') ?? false;
       let list = db.filter(e => e.guildId === i.guildId && e.platform === platform);
 
       if (input) {
@@ -363,12 +373,13 @@ client.on(Events.InteractionCreate, async i => {
       }
 
       const paused = list.filter(e => !e.enabled);
-      const { results, errors } = await runExclusive(list.filter(e => e.enabled));
+      const { results, errors } = await runExclusive(list.filter(e => e.enabled), force);
 
       const lines = [
         ...results.map(r => {
           const name = `**${r.entry.display}**`;
           if (!r.live) return `⚫ ${name} — offline`;
+          if (r.error) return `⚠️ ${name} — live, but the announcement FAILED: ${r.error}\n   ↳ Check the bot's permissions in <#${r.entry.channelId}> (View Channel, Send Messages, Embed Links)`;
           return r.announced ? `🔴 ${name} — live · announcement sent` : `🔴 ${name} — live · already announced`;
         }),
         ...paused.map(e => `⏸️ **${e.display}** — disabled`),
