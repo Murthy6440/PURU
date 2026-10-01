@@ -65,6 +65,7 @@ const log = (guild, feature, e) => sendTo(guild, cfg(guild.id).logs?.[feature], 
 // ───────────────────────── Commands ─────────────────────────
 const commands = [
   new SlashCommandBuilder().setName('help').setDescription('View stream command list'),
+  new SlashCommandBuilder().setName('recheck').setDescription('Force a fresh live status check for all configured streams').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).setDMPermission(false),
   new SlashCommandBuilder().setName('streamcheck').setDescription('Check all configured streams immediately').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).setDMPermission(false),
   new SlashCommandBuilder().setName('setannounce').setDescription('Set the announcement channel for a platform')
     .addStringOption((o) => o.setName('platform').setDescription('Platform').setRequired(true).addChoices({ name: 'YouTube', value: 'youtube' }, { name: 'Kick', value: 'kick' }))
@@ -84,7 +85,7 @@ const commands = [
 const H = {
   async help(i) {
     const sections = [
-      { name: '⚙️ STREAM SETTINGS', value: '/setannounce\n/streamcheck', inline: false },
+      { name: '⚙️ STREAM SETTINGS', value: '/setannounce\n/recheck\n/streamcheck', inline: false },
       { name: '📺 YOUTUBE', value: '/youtube add\n/youtube remove\n/youtube list', inline: false },
       { name: '🟢 KICK', value: '/kicklive add\n/kicklive remove\n/kicklive list', inline: false },
     ];
@@ -100,12 +101,64 @@ const H = {
     return i.reply({ embeds: [e] });
   },
 
+  async recheck(i) {
+    console.log('[RECHECK] Starting manual stream check');
+    await i.deferReply();
+
+    try {
+      const guild = i.guild;
+      const c = cfg(guild.id);
+      const kickResults = [];
+      const youtubeResults = [];
+
+      for (const k of c.kick) {
+        try {
+          const result = await recheckKickChannel(guild, k);
+          kickResults.push(result);
+        } catch (error) {
+          console.error('[RECHECK][KICK] API error:', error);
+          kickResults.push({ slug: k.slug, status: 'CHECK FAILED', isLive: false, viewers: null, message: '⚠️ ' + k.slug + ' — CHECK FAILED' });
+        }
+      }
+
+      for (const y of c.youtube) {
+        try {
+          const result = await recheckYouTubeChannel(guild, y);
+          youtubeResults.push(result);
+        } catch (error) {
+          console.error('[RECHECK][YOUTUBE] API error:', error);
+          youtubeResults.push({ slug: y.name || y.id, status: 'CHECK FAILED', isLive: false, viewers: null, message: '⚠️ ' + (y.name || y.id) + ' — CHECK FAILED' });
+        }
+      }
+
+      const kickLines = kickResults.length
+        ? kickResults.map((k) => k.message).join('\n')
+        : '⚫ No Kick channels tracked';
+      const youtubeLines = youtubeResults.length
+        ? youtubeResults.map((y) => y.message).join('\n')
+        : '⚫ No YouTube channels tracked';
+
+      const e = new EmbedBuilder()
+        .setTitle('🔎 Stream Recheck')
+        .setDescription(`Last checked: <t:${Math.floor(Date.now() / 1000)}:F>`) 
+        .setColor(COLORS.main)
+        .addFields(
+          { name: 'Kick', value: kickLines || '⚫ No Kick channels tracked', inline: false },
+          { name: 'YouTube', value: youtubeLines || '⚫ No YouTube channels tracked', inline: false },
+        )
+        .setTimestamp()
+        .setFooter({ text: FOOTER_TEXT });
+
+      return i.editReply({ embeds: [e] });
+    } catch (error) {
+      console.error('Manual recheck failed:', error);
+      return i.editReply({ embeds: [errorEmbed('STREAM RECHECK FAILED', 'The manual live status check could not complete right now.')] });
+    }
+  },
+
   async streamcheck(i) {
     await i.deferReply();
     try {
-      if (typeof pollKickStreams === 'function') await pollKickStreams();
-      if (typeof pollYoutubeChannels === 'function') await pollYoutubeChannels();
-
       const guild = i.guild;
       const c = cfg(guild.id);
       const kickLines = c.kick.length ? c.kick.map((k) => `${k.live ? '🟢' : '⚫'} ${k.slug} — ${k.live ? 'LIVE' : 'OFFLINE'}`).join('\n') : '⚫ No Kick channels tracked';
@@ -179,7 +232,7 @@ const H = {
         return i.editReply({ embeds: [errorEmbed('YOUTUBE ERROR', 'Could not read that channel right now. Please try again later.')] });
       }
 
-      c.youtube.push({ id, name: feed.author, seen: feed.videos.map((v) => v.id), live: false });
+      c.youtube.push({ id, name: feed.author, seen: feed.videos.map((v) => v.id), live: false, isLive: false, lastLiveVideoId: null });
       save();
 
       const e = successEmbed('YOUTUBE CHANNEL ADDED', `Now tracking **${feed.author}**.`, [
@@ -216,7 +269,7 @@ const H = {
       return i.reply({ embeds: [before === c.kick.length ? errorEmbed('STREAMER NOT FOUND', 'That Kick streamer is not currently being tracked.') : successEmbed('KICK STREAMER REMOVED', `Stopped tracking **${slug}**.`)] });
     }
     if (c.kick.some((k) => k.slug === slug)) return i.reply({ embeds: [warningEmbed('ALREADY TRACKED', 'That streamer is already in the list.')] });
-    c.kick.push({ slug, live: false }); save();
+    c.kick.push({ slug, live: false, isLive: false, lastSessionId: null }); save();
     const e = successEmbed('KICK STREAMER ADDED', `Now tracking **${slug}**.`, [{ name: 'Platform', value: 'Kick', inline: true }, { name: 'Notifications', value: 'Enabled', inline: true }]);
     await i.reply({ embeds: [e] });
   },
@@ -257,7 +310,7 @@ client.on('interactionCreate', async (i) => {
   }
 
   if (!i.isChatInputCommand() || !i.inGuild()) return;
-  if (i.commandName === 'streamcheck' && !isAdmin(i.member)) {
+  if ((i.commandName === 'recheck' || i.commandName === 'streamcheck') && !isAdmin(i.member)) {
     const permissionText = 'You need:\n**Administrator**\n\nto use this command.';
     const p = { embeds: [errorEmbed('PERMISSION REQUIRED', permissionText)], flags: MessageFlags.Ephemeral };
     return (i.deferred || i.replied) ? i.followUp(p).catch(() => {}) : i.reply(p).catch(() => {});
@@ -363,11 +416,11 @@ const YT_ENABLED = Boolean(YT_KEY);
 async function fetchYouTubeDetails(ids) {
   if (!YT_KEY || !ids.length) return null;
   try {
-    const res = await fetchWithTimeout(`https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${ids.slice(0, 50).join(',')}&key=${YT_KEY}`, {}, 10000);
+    const res = await fetchWithTimeout(`https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${ids.slice(0, 50).join(',')}&key=${YT_KEY}`, {}, 10000);
     if (!res.ok) { console.error('YouTube API error', res.status, (await res.text()).slice(0, 200)); return null; }
     const json = await res.json();
     const map = {};
-    for (const v of json.items ?? []) map[v.id] = v.snippet;
+    for (const v of json.items ?? []) map[v.id] = v;
     return map;
   } catch (e) { console.error('YouTube API failed', e.message); return null; }
 }
@@ -442,7 +495,7 @@ async function checkYouTubeChannel(guild, y, options = {}) {
     const state = sn?.liveBroadcastContent ?? 'none';
     if (state === 'upcoming') continue;
     y.seen.push(v.id);
-    const done = { v, live: state === 'live', thumb: sn?.thumbnails?.maxres?.url ?? sn?.thumbnails?.high?.url };
+    const done = { v, live: state === 'live', thumb: sn?.snippet?.thumbnails?.maxres?.url ?? sn?.snippet?.thumbnails?.high?.url };
     if (done.live) currentLive = true;
     if (done.live || !announceOnlyLive) toSend.push(done);
   }
@@ -455,6 +508,7 @@ async function checkYouTubeChannel(guild, y, options = {}) {
   }
 
   y.live = currentLive;
+  y.isLive = currentLive;
   y.seen = y.seen.slice(-60); save();
   if (!a) return { sent: false, live: currentLive, value: currentLive ? y.name || y.id : null };
 
@@ -477,6 +531,75 @@ async function checkYouTubeChannel(guild, y, options = {}) {
   }
 
   return { sent: sentCount > 0, live: currentLive || sentCount > 0, value: liveName || (currentLive ? y.name || y.id : null) };
+}
+
+async function recheckYouTubeChannel(guild, y) {
+  const handle = y.name || y.id;
+  try {
+    const channelId = (await resolveYoutubeChannel(y.id || y.name)) || y.id;
+    if (!channelId) {
+      return { slug: handle, status: 'OFFLINE', isLive: false, viewers: null, message: `⚫ ${handle} — OFFLINE` };
+    }
+
+    const feed = await fetchYouTubeFeed(channelId);
+    if (!feed?.videos?.length) {
+      return { slug: handle, status: 'OFFLINE', isLive: false, viewers: null, message: `⚫ ${handle} — OFFLINE` };
+    }
+
+    const videoIds = feed.videos.slice(0, 12).map((v) => v.id);
+    const details = await fetchYouTubeDetails(videoIds);
+    if (!details) {
+      return { slug: handle, status: 'CHECK FAILED', isLive: false, viewers: null, message: `⚠️ ${handle} — CHECK FAILED` };
+    }
+
+    const liveEntry = feed.videos
+      .map((v) => ({ ...v, details: details[v.id] }))
+      .find((v) => {
+        const sn = v.details;
+        if (!sn) return false;
+        const isLive = sn.liveBroadcastContent === 'live' || (sn.liveStreamingDetails && !sn.liveStreamingDetails.actualEndTime);
+        return isLive;
+      });
+
+    const isLive = Boolean(liveEntry);
+    const videoId = liveEntry?.id ?? null;
+    const currentViewers = liveEntry?.details?.liveStreamingDetails?.concurrentViewers ?? null;
+    console.log('[RECHECK][YOUTUBE]', handle, { isLive, videoId });
+
+    if (!isLive) {
+      y.live = false;
+      y.isLive = false;
+      save();
+      return { slug: handle, status: 'OFFLINE', isLive: false, viewers: currentViewers, message: `⚫ ${handle} — OFFLINE` };
+    }
+
+    const currentLiveVideo = { id: videoId, title: liveEntry.title || `${handle} is live` };
+    const alreadyAnnounced = Boolean((y.isLive ?? y.live) && y.lastLiveVideoId && y.lastLiveVideoId === videoId);
+    const a = cfg(guild.id).announce.youtube;
+    let sent = false;
+
+    if (!alreadyAnnounced && a) {
+      const thumb = liveEntry.details?.snippet?.thumbnails?.maxres?.url ?? liveEntry.details?.snippet?.thumbnails?.high?.url;
+      const ok = await announceYouTubeLive(guild, a, feed, currentLiveVideo, thumb);
+      sent = Boolean(ok);
+    }
+
+    y.live = true;
+    y.isLive = true;
+    y.lastLiveVideoId = videoId;
+    save();
+
+    return {
+      slug: handle,
+      status: sent ? 'LIVE' : (alreadyAnnounced ? 'ALREADY ANNOUNCED' : 'LIVE'),
+      isLive: true,
+      viewers: currentViewers,
+      message: `🔴 ${handle} — LIVE\n👥 ${currentViewers ?? 'N/A'} viewers\n📺 Current livestream detected\n${sent ? '✅ Announcement sent' : '⏭️ Already announced'}`,
+    };
+  } catch (error) {
+    console.error('[RECHECK][YOUTUBE] API error:', error);
+    return { slug: handle, status: 'CHECK FAILED', isLive: false, viewers: null, message: `⚠️ ${handle} — CHECK FAILED` };
+  }
 }
 
 const pollYoutubeChannels = async function pollYouTube() {
@@ -526,6 +649,7 @@ async function fetchKick(slug, retry = true) {
     const live = Boolean(ch.stream?.is_live || ch.is_live || ch.livestream?.is_live || ch.livestream);
     return {
       live,
+      sessionId: ch.stream?.id ?? ch.livestream?.id ?? ch.livestream?.session_id ?? ch.session_id ?? null,
       title: ch.stream_title ?? ch.livestream?.session_title ?? ch.title,
       category: ch.category?.name ?? ch.livestream?.categories?.[0]?.name,
       thumbnail: ch.stream?.thumbnail ?? ch.livestream?.thumbnail?.src ?? ch.livestream?.thumbnail?.url,
@@ -571,14 +695,73 @@ async function checkKickChannel(guild, k, options = {}) {
   const a = c.announce.kick;
   const d = await fetchKick(k.slug);
   if (!d) return { sent: false, live: false };
-  if (d.live && !k.live) {
-    k.live = true; save();
+  const currentSessionId = d.sessionId ?? null;
+  const shouldAnnounce = Boolean(d.live && (!k.lastSessionId || (currentSessionId && currentSessionId !== k.lastSessionId)));
+  if (d.live && shouldAnnounce) {
+    k.live = true;
+    k.isLive = true;
+    if (currentSessionId) k.lastSessionId = currentSessionId;
+    save();
     if (!a) return { sent: false, live: true, value: d.name };
     const sent = await announceKickLive(guild, a, d);
     return { sent, live: true, value: d.name };
   }
-  if (!d.live && k.live) { k.live = false; save(); }
+  if (d.live) {
+    k.live = true;
+    k.isLive = true;
+    if (currentSessionId) k.lastSessionId = currentSessionId;
+    save();
+    return { sent: false, live: true, value: d.name };
+  }
+  if (!d.live && (k.live || k.isLive)) { k.live = false; k.isLive = false; save(); }
   return { sent: false, live: !!d.live, value: d.live ? d.name : null };
+}
+
+async function recheckKickChannel(guild, k) {
+  const username = k.slug;
+  try {
+    const data = await fetchKickChannel(username);
+    if (!data) {
+      console.error('[RECHECK][KICK] API error:', new Error('Kick data unavailable for ' + username));
+      return { slug: username, status: 'CHECK FAILED', isLive: false, viewers: null, message: `⚠️ ${username} — CHECK FAILED` };
+    }
+
+    const isLive = Boolean(data.live);
+    const sessionId = data.sessionId ?? null;
+    console.log('[RECHECK][KICK]', username, { isLive, sessionId });
+
+    if (!isLive) {
+      k.live = false;
+      k.isLive = false;
+      save();
+      return { slug: username, status: 'OFFLINE', isLive: false, viewers: data.viewers ?? null, message: `⚫ ${username} — OFFLINE` };
+    }
+
+    const wasAlreadyLive = Boolean(k.isLive ?? k.live);
+    const alreadyAnnounced = Boolean(wasAlreadyLive && k.lastSessionId && sessionId && k.lastSessionId === sessionId);
+    const a = cfg(guild.id).announce.kick;
+    let sent = false;
+
+    if (!alreadyAnnounced && a) {
+      sent = await announceKickLive(guild, a, data);
+    }
+
+    k.isLive = true;
+    k.live = true;
+    if (sessionId) k.lastSessionId = sessionId;
+    save();
+
+    return {
+      slug: username,
+      status: sent ? 'LIVE' : (alreadyAnnounced ? 'ALREADY ANNOUNCED' : 'LIVE'),
+      isLive: true,
+      viewers: data.viewers ?? null,
+      message: `🟢 ${username} — LIVE\n👥 ${data.viewers ?? 'N/A'} viewers\n📺 Current session detected\n${sent ? '✅ Announcement sent' : '⏭️ Already announced'}`,
+    };
+  } catch (error) {
+    console.error('[RECHECK][KICK] API error:', error);
+    return { slug: username, status: 'CHECK FAILED', isLive: false, viewers: null, message: `⚠️ ${username} — CHECK FAILED` };
+  }
 }
 
 const pollKickStreams = async function pollKick() {
