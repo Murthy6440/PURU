@@ -30,7 +30,6 @@ const {
   YOUTUBE_CHANNEL_ID
 } = process.env;
 
-// Fail fast on missing required config
 for (const key of ["DISCORD_TOKEN", "ANNOUNCEMENT_CHANNEL_ID"]) {
   if (!process.env[key]) {
     console.error(`Missing required env var: ${key}`);
@@ -47,8 +46,15 @@ if (!KICK_ENABLED) console.warn("[Kick] Disabled (missing KICK_USERNAME / KICK_C
 if (!YOUTUBE_ENABLED) console.warn("[YouTube] Disabled (need YOUTUBE_API_KEY and a channel ID starting with UC)");
 
 const CHECK_INTERVAL = 30 * 1000;
-const OFFLINE_STRIKES_REQUIRED = 2; // avoids re-announcing after a one-off API blip
 const FETCH_TIMEOUT = 10 * 1000;
+
+// A stream counts as the "same" broadcast until it has been offline this long.
+// Stops re-announcements from API blips or a quick stream restart.
+const OFFLINE_RESET_MS = 10 * 60 * 1000;
+
+// The role is pinged at most once per this window, even if you go live on
+// Kick and YouTube at different times (the 2nd announcement is sent without a ping).
+const PING_COOLDOWN_MS = 15 * 60 * 1000;
 
 const COMMAND_ENABLEMENTS = {
   recheck: process.env.ENABLE_RECHECK !== "false"
@@ -63,14 +69,67 @@ function normalizeMentionRoleId(value) {
 const ANNOUNCEMENT_ROLE_ID = normalizeMentionRoleId(process.env.ANNOUNCEMENT_ROLE_ID);
 
 // ===============================
+// SINGLE-INSTANCE LOCK
+// (two copies of the bot running = every announcement posted twice)
+// ===============================
+
+const LOCK_FILE = path.join(__dirname, "bot.lock");
+
+function acquireLock() {
+  try {
+    const oldPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8"), 10);
+    if (oldPid && oldPid !== process.pid) {
+      try {
+        process.kill(oldPid, 0); // throws if the process doesn't exist
+        console.error(
+          `Another instance is already running (pid ${oldPid}). Stop it first, or delete bot.lock if it is stale.`
+        );
+        process.exit(1);
+      } catch (e) {
+        if (e.code === "EPERM") {
+          console.error(`Another instance appears to be running (pid ${oldPid}).`);
+          process.exit(1);
+        }
+        /* ESRCH: stale lock, continue */
+      }
+    }
+  } catch {
+    /* no lock file */
+  }
+  fs.writeFileSync(LOCK_FILE, String(process.pid));
+  const release = () => {
+    try {
+      if (parseInt(fs.readFileSync(LOCK_FILE, "utf8"), 10) === process.pid) fs.unlinkSync(LOCK_FILE);
+    } catch {}
+  };
+  process.on("exit", release);
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+}
+
+acquireLock();
+
+// ===============================
 // STATE (persisted so restarts don't re-announce)
 // ===============================
 
 const STATE_FILE = path.join(__dirname, "state.json");
 
-let state = { kickAnnounced: null, youtubeAnnounced: null };
+const state = {
+  kick: { announced: false, lastLive: 0 },
+  youtube: { announced: false, lastLive: 0 },
+  lastPingAt: 0
+};
+
 try {
-  state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) };
+  const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  Object.assign(state.kick, saved.kick);
+  Object.assign(state.youtube, saved.youtube);
+  state.lastPingAt = saved.lastPingAt || 0;
+
+  // migrate state.json written by the previous version
+  if (saved.kickAnnounced && !saved.kick) Object.assign(state.kick, { announced: true, lastLive: Date.now() });
+  if (saved.youtubeAnnounced && !saved.youtube) Object.assign(state.youtube, { announced: true, lastLive: Date.now() });
 } catch {
   /* first run */
 }
@@ -85,8 +144,6 @@ function saveState() {
 
 let kickToken = null;
 let kickTokenExpiresAt = 0;
-let kickOfflineStrikes = 0;
-let youtubeOfflineStrikes = 0;
 
 // ===============================
 // HELPERS
@@ -104,15 +161,30 @@ async function getAnnouncementChannel() {
   return channel;
 }
 
-async function sendAnnouncement(title, embed) {
-  const channel = await getAnnouncementChannel();
-  const mention = ANNOUNCEMENT_ROLE_ID ? `<@&${ANNOUNCEMENT_ROLE_ID}> ` : "";
+// Extra safety net: if the bot already posted this link recently (e.g. from a
+// second instance on another machine), don't post it again.
+async function alreadyPosted(channel, urls) {
+  try {
+    const messages = await channel.messages.fetch({ limit: 15 });
+    const cutoff = Date.now() - OFFLINE_RESET_MS;
+    return messages.some(
+      m =>
+        m.author.id === client.user.id &&
+        m.createdTimestamp > cutoff &&
+        m.embeds.some(e => e.url && urls.includes(e.url))
+    );
+  } catch {
+    return false; // missing Read Message History permission etc.
+  }
+}
 
-  await channel.send({
-    content: `${mention}${title}`,
-    embeds: [embed],
-    allowedMentions: { roles: ANNOUNCEMENT_ROLE_ID ? [ANNOUNCEMENT_ROLE_ID] : [] }
-  });
+function trackLive(platformState, live) {
+  const now = Date.now();
+  if (live) {
+    platformState.lastLive = now;
+  } else if (platformState.announced && now - platformState.lastLive > OFFLINE_RESET_MS) {
+    platformState.announced = false;
+  }
 }
 
 // ===============================
@@ -122,7 +194,6 @@ async function sendAnnouncement(title, embed) {
 async function getKickToken() {
   if (kickToken && Date.now() < kickTokenExpiresAt) return kickToken;
 
-  // Kick expects client credentials in the form body (not Basic auth)
   const response = await fetchTimeout("https://id.kick.com/oauth/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -141,72 +212,42 @@ async function getKickToken() {
   return kickToken;
 }
 
-async function checkKick() {
-  if (!KICK_ENABLED) return;
+async function getKickStatus() {
+  const token = await getKickToken();
 
-  try {
-    const token = await getKickToken();
+  const response = await fetchTimeout(
+    `https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(KICK_USERNAME)}`,
+    { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } }
+  );
 
-    const response = await fetchTimeout(
-      `https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(KICK_USERNAME)}`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } }
-    );
-
-    if (response.status === 401) {
-      kickToken = null; // force a fresh token next time
-      throw new Error("Kick API error: 401 (token reset)");
-    }
-    if (!response.ok) throw new Error(`Kick API error: ${response.status}`);
-
-    const data = await response.json();
-    const channel = data.data?.[0];
-
-    if (!channel) {
-      console.log(`[Kick] Channel not found: ${KICK_USERNAME}`);
-      return;
-    }
-
-    const isLive = channel.stream?.is_live === true;
-    console.log(`[Kick] ${KICK_USERNAME}: ${isLive ? "LIVE" : "OFFLINE"}`);
-
-    if (!isLive) {
-      if (++kickOfflineStrikes >= OFFLINE_STRIKES_REQUIRED && state.kickAnnounced) {
-        state.kickAnnounced = null;
-        saveState();
-      }
-      return;
-    }
-
-    kickOfflineStrikes = 0;
-
-    // start_time is stable for the whole broadcast and changes on the next one
-    const sessionId = channel.stream.start_time || `${KICK_USERNAME}-live`;
-    const key = `${KICK_USERNAME}:${sessionId}`;
-
-    if (state.kickAnnounced === key) return;
-
-    await announceKick(channel);
-
-    // Only mark as announced after a successful send, so failures are retried
-    state.kickAnnounced = key;
-    saveState();
-  } catch (error) {
-    console.error("[Kick] Error:", error.message);
+  if (response.status === 401) {
+    kickToken = null;
+    throw new Error("Kick API error: 401 (token reset)");
   }
+  if (!response.ok) throw new Error(`Kick API error: ${response.status}`);
+
+  const data = await response.json();
+  const channel = data.data?.[0];
+  if (!channel) throw new Error(`Channel not found: ${KICK_USERNAME}`);
+
+  const live = channel.stream?.is_live === true;
+  console.log(`[Kick] ${KICK_USERNAME}: ${live ? "LIVE" : "OFFLINE"}`);
+  return { live, channel };
 }
 
-async function announceKick(channel) {
+function buildKickAnnouncement(channel) {
   const stream = channel.stream || {};
   const name = channel.slug || KICK_USERNAME;
   const title = channel.stream_title || `${name} is Live!`;
   const category = channel.category?.name || "Live Stream";
   const viewers = stream.viewer_count ?? 0;
   const thumbnail = stream.thumbnail || channel.banner_picture || null;
+  const url = `https://kick.com/${KICK_USERNAME}`;
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: `${name} is LIVE on Kick` })
     .setTitle(title.slice(0, 256))
-    .setURL(`https://kick.com/${KICK_USERNAME}`)
+    .setURL(url)
     .setDescription(
       `🔴 **${name} is now live!**\n\n` +
         `🎮 **Category:** ${category}\n` +
@@ -217,18 +258,16 @@ async function announceKick(channel) {
 
   if (thumbnail) embed.setImage(thumbnail);
 
-  await sendAnnouncement(title, embed);
-  console.log("[Kick] Announcement sent");
+  return { platform: "kick", title, url, embed };
 }
 
 // ===============================
 // YOUTUBE
+// (uploads playlist + videos.list = ~2 quota units/check; search.list would
+// cost 100 units and exhaust the daily quota in under an hour)
 // ===============================
-// search.list costs 100 quota units per call (daily quota is 10,000), so polling it
-// every 30s burns the quota in under an hour. Instead we use the uploads playlist
-// (1 unit) + videos.list (1 unit) = 2 units per check.
 
-async function findYouTubeLiveVideo() {
+async function getYouTubeStatus() {
   const key = encodeURIComponent(YOUTUBE_API_KEY);
   const uploadsPlaylist = "UU" + YOUTUBE_CHANNEL_ID.slice(2);
 
@@ -240,52 +279,26 @@ async function findYouTubeLiveVideo() {
 
   const pl = await plRes.json();
   const ids = (pl.items || []).map(i => i.contentDetails?.videoId).filter(Boolean);
-  if (!ids.length) return null;
 
-  const vRes = await fetchTimeout(
-    "https://www.googleapis.com/youtube/v3/videos" +
-      `?part=snippet,liveStreamingDetails&id=${ids.join(",")}&key=${key}`
-  );
-  if (!vRes.ok) throw new Error(`YouTube videos API error: ${vRes.status}`);
-
-  const v = await vRes.json();
-  return (v.items || []).find(item => item.snippet?.liveBroadcastContent === "live") || null;
-}
-
-async function checkYouTube() {
-  if (!YOUTUBE_ENABLED) return;
-
-  try {
-    const liveVideo = await findYouTubeLiveVideo();
-
-    if (!liveVideo) {
-      console.log("[YouTube] OFFLINE");
-      if (++youtubeOfflineStrikes >= OFFLINE_STRIKES_REQUIRED && state.youtubeAnnounced) {
-        state.youtubeAnnounced = null;
-        saveState();
-      }
-      return;
-    }
-
-    youtubeOfflineStrikes = 0;
-
-    const key = `${YOUTUBE_CHANNEL_ID}:${liveVideo.id}`;
-    console.log(`[YouTube] LIVE: ${liveVideo.id}`);
-
-    if (state.youtubeAnnounced === key) return;
-
-    await announceYouTube(liveVideo);
-
-    state.youtubeAnnounced = key;
-    saveState();
-  } catch (error) {
-    console.error("[YouTube] Error:", error.message);
+  let liveVideo = null;
+  if (ids.length) {
+    const vRes = await fetchTimeout(
+      "https://www.googleapis.com/youtube/v3/videos" +
+        `?part=snippet&id=${ids.join(",")}&key=${key}`
+    );
+    if (!vRes.ok) throw new Error(`YouTube videos API error: ${vRes.status}`);
+    const v = await vRes.json();
+    liveVideo = (v.items || []).find(i => i.snippet?.liveBroadcastContent === "live") || null;
   }
+
+  console.log(`[YouTube] ${liveVideo ? "LIVE: " + liveVideo.id : "OFFLINE"}`);
+  return { live: Boolean(liveVideo), video: liveVideo };
 }
 
-async function announceYouTube(video) {
+function buildYouTubeAnnouncement(video) {
   const snippet = video.snippet;
   const title = snippet.title || "YouTube Live Stream";
+  const url = `https://www.youtube.com/watch?v=${video.id}`;
   const thumbnail =
     snippet.thumbnails?.maxres?.url ||
     snippet.thumbnails?.high?.url ||
@@ -295,7 +308,7 @@ async function announceYouTube(video) {
   const embed = new EmbedBuilder()
     .setAuthor({ name: `${snippet.channelTitle} is LIVE on YouTube` })
     .setTitle(title.slice(0, 256))
-    .setURL(`https://www.youtube.com/watch?v=${video.id}`)
+    .setURL(url)
     .setDescription(
       `🔴 **${snippet.channelTitle} is now live!**\n\n` +
         `📺 **Watch the stream on YouTube**`
@@ -305,8 +318,33 @@ async function announceYouTube(video) {
 
   if (thumbnail) embed.setImage(thumbnail);
 
-  await sendAnnouncement(title, embed);
-  console.log("[YouTube] Announcement sent");
+  return { platform: "youtube", title, url, embed };
+}
+
+// ===============================
+// ANNOUNCE (one message, one ping, even if both platforms go live together)
+// ===============================
+
+async function announce(pending) {
+  const channel = await getAnnouncementChannel();
+
+  if (await alreadyPosted(channel, pending.map(p => p.url))) {
+    console.log("Already announced recently in channel, skipping");
+    return;
+  }
+
+  const now = Date.now();
+  const shouldPing = ANNOUNCEMENT_ROLE_ID && now - state.lastPingAt > PING_COOLDOWN_MS;
+  const mention = shouldPing ? `<@&${ANNOUNCEMENT_ROLE_ID}> ` : "";
+
+  await channel.send({
+    content: `${mention}${pending[0].title}`.slice(0, 2000),
+    embeds: pending.map(p => p.embed),
+    allowedMentions: { roles: shouldPing ? [ANNOUNCEMENT_ROLE_ID] : [] }
+  });
+
+  if (shouldPing) state.lastPingAt = now;
+  console.log(`Announcement sent: ${pending.map(p => p.platform).join(" + ")}`);
 }
 
 // ===============================
@@ -321,9 +359,48 @@ async function recheck() {
     return;
   }
   checking = true;
+
   try {
     console.log("Checking Kick + YouTube...");
-    await Promise.allSettled([checkKick(), checkYouTube()]);
+
+    const [kickRes, ytRes] = await Promise.allSettled([
+      KICK_ENABLED ? getKickStatus() : Promise.resolve(null),
+      YOUTUBE_ENABLED ? getYouTubeStatus() : Promise.resolve(null)
+    ]);
+
+    const pending = [];
+
+    // On an API error we leave that platform's state untouched
+    if (kickRes.status === "rejected") {
+      console.error("[Kick] Error:", kickRes.reason?.message);
+    } else if (kickRes.value) {
+      const { live, channel } = kickRes.value;
+      trackLive(state.kick, live);
+      if (live && !state.kick.announced) pending.push(buildKickAnnouncement(channel));
+    }
+
+    if (ytRes.status === "rejected") {
+      console.error("[YouTube] Error:", ytRes.reason?.message);
+    } else if (ytRes.value) {
+      const { live, video } = ytRes.value;
+      trackLive(state.youtube, live);
+      if (live && !state.youtube.announced) pending.push(buildYouTubeAnnouncement(video));
+    }
+
+    saveState();
+
+    if (!pending.length) return;
+
+    try {
+      await announce(pending);
+    } catch (error) {
+      console.error("Announcement failed (will retry next check):", error.message);
+      return;
+    }
+
+    // Mark as announced only after the send succeeded
+    for (const p of pending) state[p.platform].announced = true;
+    saveState();
   } finally {
     checking = false;
   }
@@ -368,7 +445,12 @@ async function registerCommands() {
 // READY
 // ===============================
 
+let started = false;
+
 client.once(Events.ClientReady, async () => {
+  if (started) return;
+  started = true;
+
   console.log(`Logged in as ${client.user.tag}`);
 
   await registerCommands();
