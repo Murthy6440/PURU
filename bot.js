@@ -56,6 +56,9 @@ const OFFLINE_RESET_MS = 10 * 60 * 1000; // offline this long = next live is a n
 const PING_COOLDOWN_MS = 15 * 60 * 1000; // max one role ping per server per window
 const MANUAL_RECHECK_COOLDOWN_MS = 10 * 1000;
 
+const ENABLE_KICK_COMMAND = process.env.ENABLE_KICK_COMMAND !== "false";
+const ENABLE_YOUTUBE_COMMAND = process.env.ENABLE_YOUTUBE_COMMAND !== "false";
+
 function normalizeMentionRoleId(value) {
   if (!value) return null;
   const id = String(value).trim().replace(/^<@&?|>|@/g, "").trim();
@@ -447,8 +450,18 @@ const commands = [
   new SlashCommandBuilder()
     .setName("recheck")
     .setDescription("Immediately check Kick and YouTube live status")
-    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
-].map(c => c.toJSON());
+    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+
+  ENABLE_KICK_COMMAND
+    ? new SlashCommandBuilder().setName("kick").setDescription("Check if the streamer is live on Kick")
+    : null,
+
+  ENABLE_YOUTUBE_COMMAND
+    ? new SlashCommandBuilder().setName("youtube").setDescription("Check if the streamer is live on YouTube")
+    : null
+]
+  .filter(Boolean)
+  .map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
@@ -591,6 +604,47 @@ async function handleRecheck(interaction) {
   await interaction.editReply("✅ Kick and YouTube status checked.");
 }
 
+async function handleStatusCommand(interaction, platform) {
+  const enabled = platform === "kick" ? KICK_ENABLED : YOUTUBE_ENABLED;
+  if (!enabled) {
+    return interaction.reply({
+      content: `❌ ${platform === "kick" ? "Kick" : "YouTube"} isn't configured for this bot.`,
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  await interaction.deferReply();
+
+  try {
+    if (platform === "kick") {
+      const { live, channel } = await getKickStatus();
+      const url = `https://kick.com/${KICK_USERNAME}`;
+      const embed = live
+        ? buildKickAnnouncement(channel).embed
+        : new EmbedBuilder()
+            .setAuthor({ name: `${channel.slug || KICK_USERNAME} on Kick` })
+            .setTitle("Currently offline")
+            .setURL(url)
+            .setDescription(`⚫ Not live right now.\n\n[Visit the channel](${url})`);
+      await interaction.editReply({ embeds: [embed] });
+    } else {
+      const { live, video } = await getYouTubeStatus();
+      const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}`;
+      const embed = live
+        ? buildYouTubeAnnouncement(video).embed
+        : new EmbedBuilder()
+            .setAuthor({ name: "YouTube" })
+            .setTitle("Currently offline")
+            .setURL(url)
+            .setDescription(`⚫ Not live right now.\n\n[Visit the channel](${url})`);
+      await interaction.editReply({ embeds: [embed] });
+    }
+  } catch (error) {
+    console.error(`[${platform}] Command error:`, error.message);
+    await interaction.editReply("❌ Couldn't check right now. Try again in a moment.");
+  }
+}
+
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -600,6 +654,14 @@ client.on(Events.InteractionCreate, async interaction => {
         content: "These commands only work inside a server.",
         flags: MessageFlags.Ephemeral
       });
+    }
+
+    // Public commands, no special permission needed
+    if (interaction.commandName === "kick" && ENABLE_KICK_COMMAND) {
+      return await handleStatusCommand(interaction, "kick");
+    }
+    if (interaction.commandName === "youtube" && ENABLE_YOUTUBE_COMMAND) {
+      return await handleStatusCommand(interaction, "youtube");
     }
 
     // Defense in depth: Discord already hides these, but verify server-side too
