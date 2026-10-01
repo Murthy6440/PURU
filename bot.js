@@ -8,7 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  Client, GatewayIntentBits, SlashCommandBuilder, ChannelType, EmbedBuilder,
+  Client, Events, GatewayIntentBits, SlashCommandBuilder, ChannelType, EmbedBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, MessageFlags,
 } = require('discord.js');
 
@@ -258,7 +258,7 @@ const commands = [
 const reply = (i, color, text) =>
   i.reply({ embeds: [new EmbedBuilder().setColor(color).setDescription(text)], flags: MessageFlags.Ephemeral });
 
-client.on('interactionCreate', async i => {
+client.on(Events.InteractionCreate, async i => {
   if (!i.isChatInputCommand() || !i.guildId) return;
   try {
     const isAdd = i.commandName.endsWith('add');
@@ -300,7 +300,10 @@ client.on('interactionCreate', async i => {
     }
 
     // /kick | /youtube  →  remove | disable
-    const sub = i.options.getSubcommand();
+    const sub = i.options.getSubcommand(false);
+    if (!sub) {
+      return reply(i, COLORS.err, '⚠️ This command is outdated. Please restart Discord (Ctrl+R) and try again.');
+    }
     const input = i.options.getString('user', true);
     let key = clean(input);
     if (platform === 'youtube' && !/^uc[\w-]{22}$/.test(key)) {
@@ -327,7 +330,11 @@ client.on('interactionCreate', async i => {
   }
 });
 
-client.once('clientReady', async () => {
+client.once(Events.ClientReady, async () => {
+  // wipe old guild-scoped commands that override the new global ones
+  for (const guild of client.guilds.cache.values()) {
+    await guild.commands.set([]).catch(() => {});
+  }
   await client.application.commands.set(commands);
   console.log(`Logged in as ${client.user.tag}`);
   poll();

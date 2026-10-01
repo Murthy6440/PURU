@@ -1,8 +1,8 @@
 {
   "name": "live-announcer",
   "version": "1.0.0",
-  "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "main": "bot.js",
+  "scripts": { "start": "node bot.js" },
   "engines": { "node": ">=18" },
   "dependencies": { "discord.js": "^14.16.0" }
 }
