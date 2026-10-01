@@ -738,12 +738,28 @@ async function fetchKick(slug, retry = true) {
       if (!res.ok) { console.error('Kick API error', res.status); return null; }
       const ch = (await res.json()).data?.[0];
       if (!ch) return null;
-      return { live: !!ch.stream?.is_live, title: ch.stream_title, category: ch.category?.name, thumbnail: ch.stream?.thumbnail, viewers: ch.stream?.viewer_count, name: ch.slug ?? slug };
+      const live = Boolean(ch.stream?.is_live || ch.is_live || ch.livestream?.is_live || ch.livestream);
+      return {
+        live,
+        title: ch.stream_title ?? ch.livestream?.session_title ?? ch.title,
+        category: ch.category?.name ?? ch.livestream?.categories?.[0]?.name,
+        thumbnail: ch.stream?.thumbnail ?? ch.livestream?.thumbnail?.src ?? ch.livestream?.thumbnail?.url,
+        viewers: ch.stream?.viewer_count ?? ch.livestream?.viewer_count,
+        name: ch.slug ?? slug,
+      };
     }
     const res = await fetchWithTimeout(`https://kick.com/api/v2/channels/${slug}`, { headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0' } }, 10000);
     if (!res.ok) return null;
     const d = await res.json();
-    return { live: !!d.livestream, title: d.livestream?.session_title, category: d.livestream?.categories?.[0]?.name, thumbnail: d.livestream?.thumbnail?.src ?? d.livestream?.thumbnail?.url, name: d.user?.username ?? slug };
+    const live = Boolean(d.livestream?.is_live || d.is_live || d.livestream);
+    return {
+      live,
+      title: d.livestream?.session_title ?? d.session_title ?? d.title,
+      category: d.livestream?.categories?.[0]?.name ?? d.category?.name,
+      thumbnail: d.livestream?.thumbnail?.src ?? d.livestream?.thumbnail?.url ?? d.thumbnail?.url ?? d.thumbnail,
+      viewers: d.livestream?.viewer_count ?? d.viewer_count,
+      name: d.user?.username ?? d.slug ?? slug,
+    };
   } catch (e) { console.error('Kick fetch failed', e.message); return null; }
 }
 
