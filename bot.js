@@ -270,31 +270,130 @@ const H = {
     log(i.guild, 'config', e.addFields({ name: 'By', value: `${i.user}` }));
   },
 
-  async youtube(i) {
-    const c = cfg(i.guildId), sub = i.options.getSubcommand();
-    if (sub === 'list') {
-      const t = c.youtube.length ? c.youtube.map((y) => `• **${y.name}** (\`${y.id}\`)`).join('\n') : 'Nothing tracked yet.';
-      return i.reply({ embeds: [embed('Tracked YouTube channels', t, COLORS.yt)] });
-    }
-    const input = i.options.getString('channel').trim();
-    if (sub === 'remove') {
-      const before = c.youtube.length;
-      c.youtube = c.youtube.filter((y) => y.id !== input && y.name.toLowerCase() !== input.toLowerCase());
-      save();
-      return i.reply({ embeds: [embed('YouTube', before === c.youtube.length ? 'Channel not found.' : 'Channel removed.', before === c.youtube.length ? COLORS.red : COLORS.ok)] });
-    }
-    await i.deferReply();
-    const id = await resolveYouTubeId(input);
-    if (!id) return i.editReply({ embeds: [embed('Error', 'Could not find that channel. Use the channel ID (starts with `UC`).', COLORS.red)] });
-    if (c.youtube.some((y) => y.id === id)) return i.editReply({ embeds: [embed('Already tracked', 'That channel is already in the list.', COLORS.warn)] });
-    const feed = await fetchYouTubeFeed(id);
-    if (!feed) return i.editReply({ embeds: [embed('Error', 'Could not read that channel\'s feed.', COLORS.red)] });
-    c.youtube.push({ id, name: feed.author, seen: feed.videos.map((v) => v.id) }); // baseline: don't announce old videos
+ async youtube(i) {
+  const c = cfg(i.guildId);
+  const sub = i.options.getSubcommand();
+
+  if (sub === 'list') {
+    const t = c.youtube.length
+      ? c.youtube.map((y) => `• **${y.name}** (\`${y.id}\`)`).join('\n')
+      : 'Nothing tracked yet.';
+
+    return i.reply({
+      embeds: [embed('Tracked YouTube channels', t, COLORS.yt)]
+    });
+  }
+
+  const input = i.options.getString('channel').trim();
+
+  if (sub === 'remove') {
+    const before = c.youtube.length;
+
+    c.youtube = c.youtube.filter(
+      (y) =>
+        y.id !== input &&
+        y.name.toLowerCase() !== input.toLowerCase()
+    );
+
     save();
-    const e = embed('YouTube channel added', `Now tracking **${feed.author}**.`, COLORS.ok);
+
+    return i.reply({
+      embeds: [
+        embed(
+          'YouTube',
+          before === c.youtube.length
+            ? 'Channel not found.'
+            : 'Channel removed.',
+          before === c.youtube.length ? COLORS.red : COLORS.ok
+        )
+      ]
+    });
+  }
+
+  await i.deferReply();
+
+  try {
+    const id = await resolveYouTubeId(input);
+
+    if (!id) {
+      return i.editReply({
+        embeds: [
+          embed(
+            'Error',
+            'Could not find that channel. Use a YouTube channel ID starting with `UC` or a valid @handle.',
+            COLORS.red
+          )
+        ]
+      });
+    }
+
+    if (c.youtube.some((y) => y.id === id)) {
+      return i.editReply({
+        embeds: [
+          embed(
+            'Already tracked',
+            'That channel is already in the list.',
+            COLORS.warn
+          )
+        ]
+      });
+    }
+
+    const feed = await fetchYouTubeFeed(id);
+
+    if (!feed) {
+      return i.editReply({
+        embeds: [
+          embed(
+            'YouTube Error',
+            'Could not read that channel right now. Please try again.',
+            COLORS.red
+          )
+        ]
+      });
+    }
+
+    c.youtube.push({
+      id,
+      name: feed.author,
+      seen: feed.videos.map((v) => v.id)
+    });
+
+    save();
+
+    const e = embed(
+      'YouTube channel added',
+      `Now tracking **${feed.author}**.`,
+      COLORS.ok
+    );
+
     await i.editReply({ embeds: [e] });
-    log(i.guild, 'config', e.addFields({ name: 'By', value: `${i.user}` }));
-  },
+
+    log(
+      i.guild,
+      'config',
+      e.addFields({
+        name: 'By',
+        value: `${i.user}`
+      })
+    );
+
+  } catch (error) {
+    console.error('YouTube command error:', error);
+
+    if (i.deferred || i.replied) {
+      await i.editReply({
+        embeds: [
+          embed(
+            'Error',
+            'YouTube could not be reached. Please try again in a moment.',
+            COLORS.red
+          )
+        ]
+      }).catch(() => {});
+    }
+  }
+},
 
   async kicklive(i) {
     const c = cfg(i.guildId), sub = i.options.getSubcommand();
@@ -385,14 +484,83 @@ client.on('messageCreate', async (msg) => {
 });
 
 // ───────────────────────── YouTube (RSS, no API quota) ─────────────────────────
+async function fetchWithTimeout(url, options = {}, timeout = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function resolveYouTubeId(input) {
   const direct = /(UC[\w-]{22})/.exec(input);
   if (direct) return direct[1];
-  const handle = input.replace(/^https?:\/\/(www\.)?youtube\.com\//i, '').replace(/^@?/, '@').split(/[/?]/)[0];
+
+  const handle = input
+    .replace(/^https?:\/\/(www\.)?youtube\.com\//i, '')
+    .replace(/^@?/, '@')
+    .split(/[/?]/)[0];
+
   try {
-    const html = await (await fetch(`https://www.youtube.com/${handle}`, { headers: { 'accept-language': 'en' } })).text();
+    const res = await fetchWithTimeout(
+      `https://www.youtube.com/${handle}`,
+      { headers: { 'accept-language': 'en' } }
+    );
+
+    if (!res.ok) return null;
+
+    const html = await res.text();
+
     return /"(?:externalId|channelId)":"(UC[\w-]{22})"/.exec(html)?.[1] ?? null;
-  } catch { return null; }
+  } catch (e) {
+    console.error('YouTube channel lookup failed:', e.message);
+    return null;
+  }
+}
+
+async function fetchYouTubeFeed(id) {
+  try {
+    const res = await fetchWithTimeout(
+      `https://www.youtube.com/feeds/videos.xml?channel_id=${id}`,
+      {},
+      8000
+    );
+
+    if (!res.ok) return null;
+
+    const xml = await res.text();
+
+    const author =
+      /<author>\s*<name>([^<]+)<\/name>/.exec(xml)?.[1] ?? 'Unknown';
+
+    const decode = (s) =>
+      s.replace(/&amp;/g, '&')
+       .replace(/&lt;/g, '<')
+       .replace(/&gt;/g, '>')
+       .replace(/&quot;/g, '"')
+       .replace(/&#39;/g, "'");
+
+    const videos = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)]
+      .map((m) => ({
+        id: /<yt:videoId>([^<]+)</.exec(m[1])?.[1],
+        title: decode(/<title>([^<]+)</.exec(m[1])?.[1] ?? '')
+      }))
+      .filter((v) => v.id);
+
+    return {
+      author: decode(author),
+      videos
+    };
+  } catch (e) {
+    console.error('YouTube feed failed:', e.message);
+    return null;
+  }
 }
 
 async function fetchYouTubeFeed(id) {
