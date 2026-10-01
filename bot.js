@@ -402,16 +402,28 @@ client.on(Events.InteractionCreate, async i => {
   }
 });
 
-client.once(Events.ClientReady, async () => {
-  // wipe old guild-scoped commands that override the new global ones
-  for (const guild of client.guilds.cache.values()) {
-    await guild.commands.set([]).catch(() => {});
+async function registerCommands() {
+  try {
+    await client.application.commands.set([]); // clear global copies (prevents duplicates)
+    for (const guild of client.guilds.cache.values()) {
+      await guild.commands.set(commands);
+      console.log(`✅ Registered ${commands.length} commands in ${guild.name}`);
+    }
+  } catch (err) {
+    console.error('❌ Command registration failed:', err);
   }
-  await client.application.commands.set(commands);
+}
+
+client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  await registerCommands();
   poll();
   setInterval(poll, POLL_MS);
 });
+
+// register instantly when the bot is added to a new server
+client.on(Events.GuildCreate, guild =>
+  guild.commands.set(commands).catch(console.error));
 
 // Tiny HTTP server so Render Web Services stay healthy (skip if using a Background Worker)
 if (process.env.PORT) require('http').createServer((_, r) => r.end('ok')).listen(process.env.PORT);
