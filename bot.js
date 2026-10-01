@@ -29,13 +29,21 @@ const {
   YOUTUBE_API_KEY,
 
   ANNOUNCEMENT_CHANNEL_ID,
-  ANNOUNCEMENT_ROLE_ID,
 
   KICK_USERNAME,
   YOUTUBE_CHANNEL_ID
 } = process.env;
 
 const CHECK_INTERVAL = 30 * 1000;
+
+function normalizeMentionRoleId(value) {
+  if (!value) return null;
+  const cleaned = String(value).trim();
+  const id = cleaned.replace(/^<@&?|>|@/g, "").trim();
+  return /^\d{17,20}$/.test(id) ? id : null;
+}
+
+const ANNOUNCEMENT_ROLE_ID = normalizeMentionRoleId(process.env.ANNOUNCEMENT_ROLE_ID);
 
 // ===============================
 // STATE
@@ -248,12 +256,12 @@ async function announceKick(channel) {
     embed.setImage(thumbnail);
   }
 
-  const content = ANNOUNCEMENT_ROLE_ID
+  const mention = ANNOUNCEMENT_ROLE_ID
     ? `<@&${ANNOUNCEMENT_ROLE_ID}>`
-    : "@everyone";
+    : "";
 
   await discordChannel.send({
-    content,
+    content: `${mention}${mention ? " " : ""}${title}`,
     embeds: [embed],
     allowedMentions: {
       roles: ANNOUNCEMENT_ROLE_ID
@@ -393,12 +401,12 @@ async function announceYouTube(video) {
     embed.setImage(thumbnail);
   }
 
-  const content = ANNOUNCEMENT_ROLE_ID
+  const mention = ANNOUNCEMENT_ROLE_ID
     ? `<@&${ANNOUNCEMENT_ROLE_ID}>`
-    : "@everyone";
+    : "";
 
   await discordChannel.send({
-    content,
+    content: `${mention}${mention ? " " : ""}${title}`,
     embeds: [embed],
     allowedMentions: {
       roles: ANNOUNCEMENT_ROLE_ID
