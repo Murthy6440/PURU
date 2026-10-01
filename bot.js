@@ -20,8 +20,6 @@ const client = new Client({
 
 const {
   DISCORD_TOKEN,
-  CLIENT_ID,
-  GUILD_ID,
 
   KICK_CLIENT_ID,
   KICK_CLIENT_SECRET,
@@ -473,19 +471,35 @@ async function registerCommands() {
     version: "10"
   }).setToken(DISCORD_TOKEN);
 
-  await rest.put(
-    Routes.applicationGuildCommands(
-      CLIENT_ID,
-      GUILD_ID
-    ),
-    {
-      body: commands
-    }
-  );
+  const guild = client.guilds.cache.first();
 
-  console.log(
-    "Slash commands registered"
-  );
+  if (!guild) {
+    console.error(
+      "No Discord server found. Make sure the bot is invited to a server."
+    );
+    return;
+  }
+
+  try {
+    await rest.put(
+      Routes.applicationGuildCommands(
+        client.user.id,
+        guild.id
+      ),
+      {
+        body: commands
+      }
+    );
+
+    console.log(
+      `Slash commands registered in ${guild.name} (${guild.id})`
+    );
+  } catch (error) {
+    console.error(
+      "Failed to register slash commands:",
+      error
+    );
+  }
 }
 
 // ===============================
