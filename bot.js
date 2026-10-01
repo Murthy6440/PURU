@@ -19,18 +19,9 @@ const {
 const BRAND = 'Purnima Gaming';
 const FOOTER_TEXT = 'Purnima Gaming • Discord Bot';
 const COLORS = { main: 0x7c3aed, ok: 0x22c55e, warn: 0xf59e0b, red: 0xef4444, yt: 0xff0000, kick: 0x53fc18 };
-const AUTO_MUTE_AT = 3;                 // auto-timeout when a user reaches this many warnings
-const AUTO_MUTE_MS = 60 * 60 * 1000;    // 1 hour
 const KICK_POLL_INTERVAL_MS = 30 * 1000;
 const YOUTUBE_POLL_INTERVAL_MS = 30 * 1000;
-const POLL_MS = KICK_POLL_INTERVAL_MS; // compatibility with the existing polling logic
-const LOG_FEATURES = [
-  { name: 'Moderation', value: 'moderation' },
-  { name: 'YouTube announcements', value: 'youtube' },
-  { name: 'Kick announcements', value: 'kick' },
-  { name: 'Anti-Ping', value: 'antiping' },
-  { name: 'Bot config', value: 'config' },
-];
+const POLL_MS = KICK_POLL_INTERVAL_MS;
 
 // ───────────────────────── Storage (data.json) ─────────────────────────
 const DB_FILE = './data.json';
@@ -38,13 +29,9 @@ let db = { guilds: {} };
 try { if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { console.error('DB load failed', e); }
 const save = () => { fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db, null, 2)); fs.renameSync(DB_FILE + '.tmp', DB_FILE); };
 const cfg = (gid) => (db.guilds[gid] ??= {
-  modRoles: [],
-  logs: {},                                   // feature -> channelId
   announce: { youtube: null, kick: null },    // { channel, role }
-  youtube: [],                                // { id, name, last }
+  youtube: [],                                // { id, name, seen }
   kick: [],                                   // { slug, live }
-  antiping: { enabled: true, users: [], autoWarn: true },
-  warnings: {},                               // userId -> [{ reason, mod, at }]
 });
 
 // ───────────────────────── Client ─────────────────────────
@@ -64,87 +51,25 @@ const errorEmbed = (title, description, fields = []) => makeEmbed({ title: `❌ 
 const warningEmbed = (title, description, fields = []) => makeEmbed({ title: `⚠️ ${title}`, description, color: COLORS.warn, fields });
 const infoEmbed = (title, description, fields = []) => makeEmbed({ title: `ℹ️ ${title}`, description, color: COLORS.main, fields });
 const configEmbed = (title, description, fields = []) => makeEmbed({ title: `⚙️ ${title}`, description, color: COLORS.main, fields });
-const moderationEmbed = (title, description, fields = []) => makeEmbed({ title: `🛡️ ${title}`, description, color: COLORS.main, fields });
 
 const isAdmin = (m) => m.permissions.has(PermissionFlagsBits.Administrator) || m.permissions.has(PermissionFlagsBits.ManageGuild);
-const isMod = (m) => isAdmin(m) || cfg(m.guild.id).modRoles.some((r) => m.roles.cache.has(r));
+const isMod = isAdmin;
 
 async function sendTo(guild, channelId, payload) {
   if (!channelId) return null;
   const ch = guild.channels.cache.get(channelId) ?? (await guild.channels.fetch(channelId).catch(() => null));
   return ch?.send(payload).catch((e) => console.error('send failed', e.message)) ?? null;
 }
-const log = (guild, feature, e) => sendTo(guild, cfg(guild.id).logs[feature], { embeds: [e] });
-const dm = (user, e) => user.send({ embeds: [e] }).catch(() => {});
-
-function parseDuration(s) {
-  const m = /^(\d+)\s*([smhd])$/i.exec(s.trim());
-  if (!m) return null;
-  const ms = Number(m[1]) * { s: 1e3, m: 6e4, h: 36e5, d: 864e5 }[m[2].toLowerCase()];
-  return ms > 0 && ms <= 28 * 864e5 ? ms : null; // Discord max timeout = 28 days
-}
-const fmtMs = (ms) => {
-  const d = Math.floor(ms / 864e5), h = Math.floor((ms % 864e5) / 36e5), m = Math.floor((ms % 36e5) / 6e4), s = Math.floor((ms % 6e4) / 1e3);
-  return [d && `${d}d`, h && `${h}h`, m && `${m}m`, !d && !h && !m && `${s}s`].filter(Boolean).join(' ');
-};
-
-function hierarchyCheck(i, member, action) {
-  if (!member) return null;
-  if (member.id === i.user.id) return "You can't do that to yourself.";
-  if (member.id === client.user.id) return "Nice try.";
-  if (member.id === i.guild.ownerId) return "You can't target the server owner.";
-  if (i.user.id !== i.guild.ownerId && i.member.roles.highest.position <= member.roles.highest.position)
-    return "That member's top role is equal to or higher than yours.";
-  const ok = { mute: member.moderatable, kick: member.kickable, ban: member.bannable }[action];
-  if (ok === false) return "My role is too low to do that. Move my role above theirs.";
-  return null;
-}
-
-async function addWarning(guild, user, modId, reason) {
-  const list = (cfg(guild.id).warnings[user.id] ??= []);
-  list.push({ reason, mod: modId, at: Date.now() });
-  save();
-  let auto = false;
-  if (list.length >= AUTO_MUTE_AT) {
-    const m = await guild.members.fetch(user.id).catch(() => null);
-    if (m?.moderatable) { await m.timeout(AUTO_MUTE_MS, `Auto-mute: ${list.length} warnings`).catch(() => {}); auto = true; }
-  }
-  return { count: list.length, auto };
-}
+const log = (guild, feature, e) => sendTo(guild, cfg(guild.id).logs?.[feature], { embeds: [e] });
 
 // ───────────────────────── Commands ─────────────────────────
-const modPerm = PermissionFlagsBits.ModerateMembers;
-const reasonOpt = (o) => o.setName('reason').setDescription('Reason');
-const userOpt = (o) => o.setName('user').setDescription('Target user').setRequired(true);
-
 const commands = [
-  new SlashCommandBuilder().setName('help').setDescription('View bot commands and categories'),
-  new SlashCommandBuilder().setName('rechecklive').setDescription('Immediately re-check all configured live channels'),
-  new SlashCommandBuilder().setName('streamcheck').setDescription('Check all configured streams immediately'),
-  new SlashCommandBuilder().setName('warn').setDescription('Warn a member')
-    .addUserOption(userOpt).addStringOption((o) => reasonOpt(o).setRequired(true)),
-  new SlashCommandBuilder().setName('warnings').setDescription('View a member\'s warnings').addUserOption(userOpt),
-  new SlashCommandBuilder().setName('clearwarnings').setDescription('Clear all warnings of a member').addUserOption(userOpt),
-  new SlashCommandBuilder().setName('mute').setDescription('Timeout a member')
-    .addUserOption(userOpt)
-    .addStringOption((o) => o.setName('duration').setDescription('e.g. 10m, 2h, 1d (max 28d)').setRequired(true))
-    .addStringOption(reasonOpt),
-  new SlashCommandBuilder().setName('unmute').setDescription('Remove a timeout').addUserOption(userOpt).addStringOption(reasonOpt),
-  new SlashCommandBuilder().setName('kick').setDescription('Kick a member').addUserOption(userOpt).addStringOption(reasonOpt),
-  new SlashCommandBuilder().setName('ban').setDescription('Ban a user')
-    .addUserOption(userOpt).addStringOption(reasonOpt)
-    .addIntegerOption((o) => o.setName('delete_days').setDescription('Delete their messages from the last N days (0-7)').setMinValue(0).setMaxValue(7)),
-  new SlashCommandBuilder().setName('unban').setDescription('Unban a user by ID')
-    .addStringOption((o) => o.setName('user_id').setDescription('User ID').setRequired(true)).addStringOption(reasonOpt),
-
-  new SlashCommandBuilder().setName('setlogs').setDescription('Set (or disable) the log channel for a feature')
-    .addStringOption((o) => o.setName('feature').setDescription('Feature').setRequired(true).addChoices(...LOG_FEATURES))
-    .addChannelOption((o) => o.setName('channel').setDescription('Leave empty to disable').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
+  new SlashCommandBuilder().setName('help').setDescription('View stream command list'),
+  new SlashCommandBuilder().setName('streamcheck').setDescription('Check all configured streams immediately').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).setDMPermission(false),
   new SlashCommandBuilder().setName('setannounce').setDescription('Set the announcement channel for a platform')
     .addStringOption((o) => o.setName('platform').setDescription('Platform').setRequired(true).addChoices({ name: 'YouTube', value: 'youtube' }, { name: 'Kick', value: 'kick' }))
     .addChannelOption((o) => o.setName('channel').setDescription('Announcement channel').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
     .addRoleOption((o) => o.setName('ping_role').setDescription('Role to ping (optional)')),
-
   new SlashCommandBuilder().setName('youtube').setDescription('Manage YouTube channels to announce')
     .addSubcommand((s) => s.setName('add').setDescription('Track a channel').addStringOption((o) => o.setName('channel').setDescription('Channel ID (UC...), channel URL or @handle').setRequired(true)))
     .addSubcommand((s) => s.setName('remove').setDescription('Stop tracking').addStringOption((o) => o.setName('channel').setDescription('Channel ID or name').setRequired(true)))
@@ -153,74 +78,26 @@ const commands = [
     .addSubcommand((s) => s.setName('add').setDescription('Track a streamer').addStringOption((o) => o.setName('username').setDescription('Kick username').setRequired(true)))
     .addSubcommand((s) => s.setName('remove').setDescription('Stop tracking').addStringOption((o) => o.setName('username').setDescription('Kick username').setRequired(true)))
     .addSubcommand((s) => s.setName('list').setDescription('List tracked streamers')),
-
-  new SlashCommandBuilder().setName('antiping').setDescription('Protect specific users from being pinged')
-    .addSubcommand((s) => s.setName('add').setDescription('Protect a user').addUserOption(userOpt))
-    .addSubcommand((s) => s.setName('remove').setDescription('Unprotect a user').addUserOption(userOpt))
-    .addSubcommand((s) => s.setName('list').setDescription('Show protected users'))
-    .addSubcommand((s) => s.setName('toggle').setDescription('Turn anti-ping on/off')
-      .addBooleanOption((o) => o.setName('enabled').setDescription('Enabled?').setRequired(true))
-      .addBooleanOption((o) => o.setName('autowarn').setDescription('Warn people who ping protected users?'))),
-
-  new SlashCommandBuilder().setName('modrole').setDescription('Choose which roles count as moderators (Admin only)')
-    .addSubcommand((s) => s.setName('add').setDescription('Add a mod role').addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true)))
-    .addSubcommand((s) => s.setName('remove').setDescription('Remove a mod role').addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true)))
-    .addSubcommand((s) => s.setName('list').setDescription('List mod roles')),
-].map((c) => c.setDefaultMemberPermissions(c.name === 'streamcheck' ? PermissionFlagsBits.Administrator : modPerm).setDMPermission(false).toJSON());
+].map((c) => c.setDefaultMemberPermissions(PermissionFlagsBits.Administrator).setDMPermission(false).toJSON());
 
 // ───────────────────────── Handlers ─────────────────────────
 const H = {
   async help(i) {
     const sections = [
-      { name: '🛡️ MODERATION', value: '/warn\n/warnings\n/mute\n/kick\n/ban\n/unban', inline: false },
-      { name: '⚙️ CONFIGURATION', value: '/setlogs\n/setannounce\n/antiping\n/modrole', inline: false },
+      { name: '⚙️ STREAM SETTINGS', value: '/setannounce\n/streamcheck', inline: false },
       { name: '📺 YOUTUBE', value: '/youtube add\n/youtube remove\n/youtube list', inline: false },
       { name: '🟢 KICK', value: '/kicklive add\n/kicklive remove\n/kicklive list', inline: false },
-      { name: '🔧 UTILITY', value: '/help\n/rechecklive\n/streamcheck', inline: false },
     ];
 
     const e = new EmbedBuilder()
-      .setTitle('PURNIMA GAMING BOT')
-      .setDescription('Professional moderation and live announcement management for your community.')
+      .setTitle('PURNIMA GAMING STREAM BOT')
+      .setDescription('Live YouTube and Kick announcement monitoring.')
       .setColor(COLORS.main)
       .addFields(sections)
       .setTimestamp()
       .setFooter({ text: FOOTER_TEXT });
 
     return i.reply({ embeds: [e] });
-  },
-
-  async rechecklive(i) {
-    await i.deferReply();
-    const guild = i.guild;
-    const c = cfg(guild.id);
-    const found = { youtube: [], kick: [] };
-
-    try {
-      for (const y of c.youtube) {
-        const info = await checkYouTubeChannel(guild, y, { announceOnlyLive: true });
-        if (info.sent && info.value) found.youtube.push(info.value);
-      }
-
-      for (const k of c.kick) {
-        const info = await checkKickChannel(guild, k, { announceOnlyLive: true });
-        if (info.sent && info.value) found.kick.push(info.value);
-      }
-
-      if (!found.youtube.length && !found.kick.length) {
-        return i.editReply({ embeds: [infoEmbed('🔎 LIVE RECHECK COMPLETE', 'No configured YouTube or Kick channels are currently live.')] });
-      }
-
-      const fields = [];
-      if (found.youtube.length) fields.push({ name: 'YouTube', value: found.youtube.map((name) => `• ${name}`).join('\n'), inline: false });
-      if (found.kick.length) fields.push({ name: 'Kick', value: found.kick.map((name) => `• ${name}`).join('\n'), inline: false });
-
-      const e = infoEmbed('🔴 LIVE CHANNELS FOUND', 'Announcements have been sent.', fields);
-      return i.editReply({ embeds: [e] });
-    } catch (error) {
-      console.error('Manual live recheck failed:', error);
-      return i.editReply({ embeds: [errorEmbed('LIVE RECHECK FAILED', 'The live check could not be completed right now. Please try again in a moment.')] });
-    }
   },
 
   async streamcheck(i) {
@@ -245,147 +122,6 @@ const H = {
     }
   },
 
-  async warn(i) {
-    await i.deferReply();
-    const user = i.options.getUser('user'), reason = i.options.getString('reason');
-    const member = i.options.getMember('user');
-    const err = hierarchyCheck(i, member, 'warn');
-    if (err) return i.editReply({ embeds: [warningEmbed('ACTION BLOCKED', err)] });
-    const { count, auto } = await addWarning(i.guild, user, i.user.id, reason);
-    const e = moderationEmbed('MEMBER WARNED', '', [
-      { name: 'Member', value: `${user} (${user.id})`, inline: true },
-      { name: 'Moderator', value: `${i.user}`, inline: true },
-      { name: 'Reason', value: reason, inline: false },
-      { name: 'Warnings', value: `${count}${auto ? `\nAuto-mute: 1h after ${AUTO_MUTE_AT} warnings` : ''}`, inline: false },
-    ]);
-    await dm(user, embed(`You were warned in ${i.guild.name}`, `**Reason:** ${reason}\n**Warnings:** ${count}`, COLORS.warn));
-    await i.editReply({ embeds: [e] });
-    log(i.guild, 'moderation', e.addFields({ name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>` }));
-  },
-
-  async warnings(i) {
-    const user = i.options.getUser('user');
-    const list = cfg(i.guildId).warnings[user.id] ?? [];
-    if (!list.length) {
-      return i.reply({ embeds: [infoEmbed('📭 NO WARNINGS FOUND', `${user} has no recorded warnings yet.`)] });
-    }
-    const body = list.slice(-10).map((w, n) => `**${list.length - Math.min(10, list.length) + n + 1}.** ${w.reason}\n<t:${Math.floor(w.at / 1000)}:R> by <@${w.mod}>`).join('\n\n');
-    return i.reply({ embeds: [warningEmbed('WARNINGS LIST', `Member: ${user} (${user.id})`, [{ name: 'Recent cases', value: body, inline: false }])] });
-  },
-
-  async clearwarnings(i) {
-    const user = i.options.getUser('user');
-    const c = cfg(i.guildId);
-    const n = (c.warnings[user.id] ?? []).length;
-    delete c.warnings[user.id]; save();
-    const e = successEmbed('WARNINGS CLEARED', `Removed **${n}** warning(s) from ${user}.`, [{ name: 'Moderator', value: `${i.user}`, inline: true }]);
-    await i.reply({ embeds: [e] });
-    log(i.guild, 'moderation', e.addFields({ name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>` }));
-  },
-
-  async mute(i) {
-    await i.deferReply();
-    const user = i.options.getUser('user'), member = i.options.getMember('user');
-    const ms = parseDuration(i.options.getString('duration'));
-    const reason = i.options.getString('reason') ?? 'No reason provided';
-    if (!member) return i.editReply({ embeds: [errorEmbed('INVALID MEMBER', 'That user is not in the server.')] });
-    if (!ms) return i.editReply({ embeds: [errorEmbed('INVALID DURATION', 'Use formats like `10m`, `2h`, `1d` (max 28d).')] });
-    const err = hierarchyCheck(i, member, 'mute');
-    if (err) return i.editReply({ embeds: [warningEmbed('ACTION BLOCKED', err)] });
-    await member.timeout(ms, `${reason} | by ${i.user.tag}`);
-    const e = moderationEmbed('MEMBER MUTED', '', [
-      { name: 'Member', value: `${user} (${user.id})`, inline: true },
-      { name: 'Moderator', value: `${i.user}`, inline: true },
-      { name: 'Duration', value: fmtMs(ms), inline: true },
-      { name: 'Reason', value: reason, inline: false },
-    ]);
-    await dm(user, embed(`You were muted in ${i.guild.name}`, `**Duration:** ${fmtMs(ms)}\n**Reason:** ${reason}`, COLORS.warn));
-    await i.editReply({ embeds: [e] });
-    log(i.guild, 'moderation', e.addFields({ name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>` }));
-  },
-
-  async unmute(i) {
-    await i.deferReply();
-    const user = i.options.getUser('user'), member = i.options.getMember('user');
-    const reason = i.options.getString('reason') ?? 'No reason provided';
-    if (!member) return i.editReply({ embeds: [errorEmbed('INVALID MEMBER', 'That user is not in the server.')] });
-    await member.timeout(null, `${reason} | by ${i.user.tag}`);
-    const e = successEmbed('MEMBER UNMUTED', '', [
-      { name: 'Member', value: `${user} (${user.id})`, inline: true },
-      { name: 'Moderator', value: `${i.user}`, inline: true },
-      { name: 'Reason', value: reason, inline: false },
-    ]);
-    await i.editReply({ embeds: [e] });
-    log(i.guild, 'moderation', e.addFields({ name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>` }));
-  },
-
-  async kick(i) {
-    await i.deferReply();
-    const user = i.options.getUser('user'), member = i.options.getMember('user');
-    const reason = i.options.getString('reason') ?? 'No reason provided';
-    if (!member) return i.editReply({ embeds: [errorEmbed('INVALID MEMBER', 'That user is not in the server.')] });
-    const err = hierarchyCheck(i, member, 'kick');
-    if (err) return i.editReply({ embeds: [warningEmbed('ACTION BLOCKED', err)] });
-    await dm(user, embed(`You were kicked from ${i.guild.name}`, `**Reason:** ${reason}`, COLORS.red));
-    await member.kick(`${reason} | by ${i.user.tag}`);
-    const e = moderationEmbed('MEMBER KICKED', '', [
-      { name: 'Member', value: `${user} (${user.id})`, inline: true },
-      { name: 'Moderator', value: `${i.user}`, inline: true },
-      { name: 'Reason', value: reason, inline: false },
-    ]);
-    await i.editReply({ embeds: [e] });
-    log(i.guild, 'moderation', e.addFields({ name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>` }));
-  },
-
-  async ban(i) {
-    await i.deferReply();
-    const user = i.options.getUser('user'), member = i.options.getMember('user');
-    const reason = i.options.getString('reason') ?? 'No reason provided';
-    const days = i.options.getInteger('delete_days') ?? 0;
-    const err = hierarchyCheck(i, member, 'ban');
-    if (err) return i.editReply({ embeds: [warningEmbed('ACTION BLOCKED', err)] });
-    if (member) await dm(user, embed(`You were banned from ${i.guild.name}`, `**Reason:** ${reason}`, COLORS.red));
-    await i.guild.members.ban(user.id, { reason: `${reason} | by ${i.user.tag}`, deleteMessageSeconds: days * 86400 });
-    const e = moderationEmbed('MEMBER BANNED', '', [
-      { name: 'Member', value: `${user} (${user.id})`, inline: true },
-      { name: 'Moderator', value: `${i.user}`, inline: true },
-      { name: 'Reason', value: reason, inline: false },
-    ]);
-    await i.editReply({ embeds: [e] });
-    log(i.guild, 'moderation', e.addFields({ name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>` }));
-  },
-
-  async unban(i) {
-    await i.deferReply();
-    const id = i.options.getString('user_id').trim();
-    const reason = i.options.getString('reason') ?? 'No reason provided';
-    await i.guild.members.unban(id, `${reason} | by ${i.user.tag}`).catch(() => null)
-      .then(async (r) => {
-        if (!r) return i.editReply({ embeds: [errorEmbed('USER NOT FOUND', 'That user is not banned or the ID is invalid.')] });
-        const e = successEmbed('USER UNBANNED', '', [
-          { name: 'User', value: `<@${id}> (${id})`, inline: true },
-          { name: 'Moderator', value: `${i.user}`, inline: true },
-          { name: 'Reason', value: reason, inline: false },
-        ]);
-        await i.editReply({ embeds: [e] });
-        log(i.guild, 'moderation', e.addFields({ name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>` }));
-      });
-  },
-
-  async setlogs(i) {
-    const feature = i.options.getString('feature'), ch = i.options.getChannel('channel');
-    const c = cfg(i.guildId);
-    if (ch) c.logs[feature] = ch.id; else delete c.logs[feature];
-    save();
-    const e = configEmbed('CONFIGURATION UPDATED', `Updated the **${feature}** log channel.`, [
-      { name: 'Setting', value: 'Log Channel', inline: true },
-      { name: 'Feature', value: feature, inline: true },
-      { name: 'Channel', value: ch ? `${ch}` : 'Disabled', inline: false },
-    ]);
-    await i.reply({ embeds: [e] });
-    if (ch) log(i.guild, 'config', e.addFields({ name: 'Updated By', value: `${i.user}` }));
-  },
-
   async setannounce(i) {
     const p = i.options.getString('platform'), ch = i.options.getChannel('channel'), role = i.options.getRole('ping_role');
     cfg(i.guildId).announce[p] = { channel: ch.id, role: role?.id ?? null };
@@ -397,7 +133,6 @@ const H = {
       { name: 'Role', value: role ? `${role}` : 'None', inline: false },
     ]);
     await i.reply({ embeds: [e] });
-    log(i.guild, 'config', e.addFields({ name: 'Updated By', value: `${i.user}` }));
   },
 
   async youtube(i) {
@@ -410,7 +145,7 @@ const H = {
       }
       const fields = c.youtube.map((y, idx) => ({
         name: `${idx + 1}. ${y.name}`,
-        value: `Status: 🟢 Monitoring\nChannel ID: \`${y.id}\``,
+        value: `Status: ${y.live ? '🟢 Live' : '⚫ Offline'}\nChannel ID: \`${y.id}\``,
         inline: false,
       }));
       return i.reply({ embeds: [infoEmbed('📺 YOUTUBE CHANNELS', 'Live and upload notifications are currently monitoring these channels.', fields)] });
@@ -444,7 +179,7 @@ const H = {
         return i.editReply({ embeds: [errorEmbed('YOUTUBE ERROR', 'Could not read that channel right now. Please try again later.')] });
       }
 
-      c.youtube.push({ id, name: feed.author, seen: feed.videos.map((v) => v.id) });
+      c.youtube.push({ id, name: feed.author, seen: feed.videos.map((v) => v.id), live: false });
       save();
 
       const e = successEmbed('YOUTUBE CHANNEL ADDED', `Now tracking **${feed.author}**.`, [
@@ -453,7 +188,6 @@ const H = {
       ]);
 
       await i.editReply({ embeds: [e] });
-      log(i.guild, 'config', e.addFields({ name: 'Updated By', value: `${i.user}` }));
     } catch (error) {
       console.error('YouTube command error:', error);
       if (i.deferred || i.replied) {
@@ -470,7 +204,7 @@ const H = {
       }
       const fields = c.kick.map((k, idx) => ({
         name: `${idx + 1}. ${k.slug}`,
-        value: `Status: ${k.live ? '🟢 Live' : '🟡 Offline'}\nMonitoring: Enabled`,
+        value: `Status: ${k.live ? '🟢 Live' : '⚫ Offline'}\nMonitoring: Enabled`,
         inline: false,
       }));
       return i.reply({ embeds: [infoEmbed('🟢 KICK STREAMERS', 'Live notifications are currently monitoring these streamers.', fields)] });
@@ -485,42 +219,6 @@ const H = {
     c.kick.push({ slug, live: false }); save();
     const e = successEmbed('KICK STREAMER ADDED', `Now tracking **${slug}**.`, [{ name: 'Platform', value: 'Kick', inline: true }, { name: 'Notifications', value: 'Enabled', inline: true }]);
     await i.reply({ embeds: [e] });
-    log(i.guild, 'config', e.addFields({ name: 'Updated By', value: `${i.user}` }));
-  },
-
-  async antiping(i) {
-    const c = cfg(i.guildId), sub = i.options.getSubcommand();
-    if (sub === 'list') {
-      const t = c.antiping.users.length ? c.antiping.users.map((u) => `• <@${u}>`).join('\n') : 'No protected users.';
-      return i.reply({ embeds: [infoEmbed(`ANTI-PING (${c.antiping.enabled ? 'ON' : 'OFF'})`, t)] });
-    }
-    if (sub === 'toggle') {
-      c.antiping.enabled = i.options.getBoolean('enabled');
-      const aw = i.options.getBoolean('autowarn');
-      if (aw !== null) c.antiping.autoWarn = aw;
-      save();
-      return i.reply({ embeds: [successEmbed('ANTI-PING UPDATED', '', [{ name: 'Enabled', value: String(c.antiping.enabled), inline: true }, { name: 'Auto-warn', value: String(c.antiping.autoWarn), inline: true }])] });
-    }
-    const user = i.options.getUser('user');
-    if (sub === 'add') { if (!c.antiping.users.includes(user.id)) c.antiping.users.push(user.id); }
-    else c.antiping.users = c.antiping.users.filter((u) => u !== user.id);
-    save();
-    const e = successEmbed('ANTI-PING UPDATED', `${user} ${sub === 'add' ? 'is now protected' : 'is no longer protected'}.`);
-    await i.reply({ embeds: [e] });
-    log(i.guild, 'antiping', e.addFields({ name: 'Updated By', value: `${i.user}` }));
-  },
-
-  async modrole(i) {
-    if (!isAdmin(i.member)) return i.reply({ embeds: [errorEmbed('PERMISSION REQUIRED', 'You need:\n**Administrator**\n\nto manage mod roles.')], flags: MessageFlags.Ephemeral });
-    const c = cfg(i.guildId), sub = i.options.getSubcommand();
-    if (sub === 'list') return i.reply({ embeds: [infoEmbed('MODERATOR ROLES', c.modRoles.length ? c.modRoles.map((r) => `• <@&${r}>`).join('\n') : 'No configured moderator roles yet. Admins and Manage Server can still act as moderators.')] });
-    const role = i.options.getRole('role');
-    if (sub === 'add') { if (!c.modRoles.includes(role.id)) c.modRoles.push(role.id); }
-    else c.modRoles = c.modRoles.filter((r) => r !== role.id);
-    save();
-    const e = successEmbed('MODERATOR ROLE UPDATED', `${role} ${sub === 'add' ? 'added' : 'removed'}.`);
-    await i.reply({ embeds: [e] });
-    log(i.guild, 'config', e.addFields({ name: 'Updated By', value: `${i.user}` }));
   },
 };
 
@@ -564,8 +262,8 @@ client.on('interactionCreate', async (i) => {
     const p = { embeds: [errorEmbed('PERMISSION REQUIRED', permissionText)], flags: MessageFlags.Ephemeral };
     return (i.deferred || i.replied) ? i.followUp(p).catch(() => {}) : i.reply(p).catch(() => {});
   }
-  if (!isMod(i.member)) {
-    const permissionText = 'You need:\n**Moderate Members**\n\nto use this command.';
+  if (!isAdmin(i.member)) {
+    const permissionText = 'You need:\n**Administrator**\n\nto use this command.';
     const p = { embeds: [errorEmbed('PERMISSION REQUIRED', permissionText)], flags: MessageFlags.Ephemeral };
     return (i.deferred || i.replied) ? i.followUp(p).catch(() => {}) : i.reply(p).catch(() => {});
   }
@@ -576,27 +274,6 @@ client.on('interactionCreate', async (i) => {
     const p = { embeds: [errorEmbed('SOMETHING WENT WRONG', 'I could not complete that action. Check my permissions and try again later.')], flags: MessageFlags.Ephemeral };
     (i.deferred || i.replied) ? i.followUp(p).catch(() => {}) : i.reply(p).catch(() => {});
   }
-});
-
-// ───────────────────────── Anti-Ping ─────────────────────────
-client.on('messageCreate', async (msg) => {
-  if (!msg.inGuild() || msg.author.bot || !msg.member) return;
-  const c = cfg(msg.guildId);
-  if (!c.antiping.enabled || !c.antiping.users.length) return;
-  if (isMod(msg.member)) return;
-  const hit = msg.mentions.users.filter((u) => c.antiping.users.includes(u.id) && u.id !== msg.author.id);
-  if (!hit.size) return;
-
-  await msg.delete().catch(() => {});
-  const names = hit.map((u) => u.tag).join(', ');
-  let extra = '';
-  if (c.antiping.autoWarn) {
-    const { count, auto } = await addWarning(msg.guild, msg.author, client.user.id, `Pinged protected user(s): ${names}`);
-    extra = ` (warning ${count}${auto ? ', auto-muted 1h' : ''})`;
-  }
-  const notice = await msg.channel.send({ content: `${msg.author}, please don't ping protected members${extra}.` }).catch(() => null);
-  setTimeout(() => notice?.delete().catch(() => {}), 8000);
-  log(msg.guild, 'antiping', embed('Protected ping blocked', `**Author:** ${msg.author} (${msg.author.id})\n**Channel:** ${msg.channel}\n**Pinged:** ${hit.map((u) => `<@${u.id}>`).join(', ')}`, COLORS.warn));
 });
 
 // ───────────────────────── YouTube (RSS, no API quota) ─────────────────────────
