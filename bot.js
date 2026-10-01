@@ -617,6 +617,7 @@ async function fetchYouTubeFeed(id) {
 }
 
 const YT_KEY = process.env.YOUTUBE_API_KEY;
+const YT_ENABLED = Boolean(YT_KEY);
 
 // One API call (1 quota unit) checks up to 50 videos at once.
 async function fetchYouTubeDetails(ids) {
@@ -644,6 +645,7 @@ async function announceYouTubeLive(guild, announceCfg, feed, video, thumb) {
 }
 
 async function checkYouTubeChannel(guild, y, options = {}) {
+  if (!YT_ENABLED) return { sent: false, live: false, value: null };
   const { announceOnlyLive = false } = options;
   const c = cfg(guild.id);
   const a = c.announce.youtube;
@@ -710,6 +712,7 @@ async function pollYouTube() {
 // Official Kick API (needs KICK_CLIENT_ID + KICK_CLIENT_SECRET). Falls back to the
 // unofficial web endpoint if those are not set, but Cloudflare may block that one.
 const KICK_ID = process.env.KICK_CLIENT_ID, KICK_SECRET = process.env.KICK_CLIENT_SECRET;
+const KICK_ENABLED = Boolean(KICK_ID && KICK_SECRET);
 let kickToken = { value: null, exp: 0 };
 
 async function getKickToken() {
@@ -728,37 +731,24 @@ async function getKickToken() {
 // Returns { live, title, category, thumbnail, viewers, name } or null
 async function fetchKick(slug, retry = true) {
   try {
-    if (KICK_ID && KICK_SECRET) {
-      const token = await getKickToken();
-      if (!token) return null;
-      const res = await fetchWithTimeout(`https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(slug)}`, {
-        headers: { Authorization: `Bearer ${token}`, accept: 'application/json' },
-      }, 10000);
-      if (res.status === 401 && retry) { kickToken = { value: null, exp: 0 }; return fetchKick(slug, false); }
-      if (!res.ok) { console.error('Kick API error', res.status); return null; }
-      const ch = (await res.json()).data?.[0];
-      if (!ch) return null;
-      const live = Boolean(ch.stream?.is_live || ch.is_live || ch.livestream?.is_live || ch.livestream);
-      return {
-        live,
-        title: ch.stream_title ?? ch.livestream?.session_title ?? ch.title,
-        category: ch.category?.name ?? ch.livestream?.categories?.[0]?.name,
-        thumbnail: ch.stream?.thumbnail ?? ch.livestream?.thumbnail?.src ?? ch.livestream?.thumbnail?.url,
-        viewers: ch.stream?.viewer_count ?? ch.livestream?.viewer_count,
-        name: ch.slug ?? slug,
-      };
-    }
-    const res = await fetchWithTimeout(`https://kick.com/api/v2/channels/${slug}`, { headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0' } }, 10000);
-    if (!res.ok) return null;
-    const d = await res.json();
-    const live = Boolean(d.livestream?.is_live || d.is_live || d.livestream);
+    if (!KICK_ENABLED) return null;
+    const token = await getKickToken();
+    if (!token) return null;
+    const res = await fetchWithTimeout(`https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(slug)}`, {
+      headers: { Authorization: `Bearer ${token}`, accept: 'application/json' },
+    }, 10000);
+    if (res.status === 401 && retry) { kickToken = { value: null, exp: 0 }; return fetchKick(slug, false); }
+    if (!res.ok) { console.error('Kick API error', res.status); return null; }
+    const ch = (await res.json()).data?.[0];
+    if (!ch) return null;
+    const live = Boolean(ch.stream?.is_live || ch.is_live || ch.livestream?.is_live || ch.livestream);
     return {
       live,
-      title: d.livestream?.session_title ?? d.session_title ?? d.title,
-      category: d.livestream?.categories?.[0]?.name ?? d.category?.name,
-      thumbnail: d.livestream?.thumbnail?.src ?? d.livestream?.thumbnail?.url ?? d.thumbnail?.url ?? d.thumbnail,
-      viewers: d.livestream?.viewer_count ?? d.viewer_count,
-      name: d.user?.username ?? d.slug ?? slug,
+      title: ch.stream_title ?? ch.livestream?.session_title ?? ch.title,
+      category: ch.category?.name ?? ch.livestream?.categories?.[0]?.name,
+      thumbnail: ch.stream?.thumbnail ?? ch.livestream?.thumbnail?.src ?? ch.livestream?.thumbnail?.url,
+      viewers: ch.stream?.viewer_count ?? ch.livestream?.viewer_count,
+      name: ch.slug ?? slug,
     };
   } catch (e) { console.error('Kick fetch failed', e.message); return null; }
 }
@@ -777,6 +767,7 @@ async function announceKickLive(guild, announceCfg, data) {
 }
 
 async function checkKickChannel(guild, k, options = {}) {
+  if (!KICK_ENABLED) return { sent: false, live: false, value: null };
   const { announceOnlyLive = false } = options;
   const c = cfg(guild.id);
   const a = c.announce.kick;
@@ -805,7 +796,7 @@ async function pollKick() {
 // ───────────────────────── Boot ─────────────────────────
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  console.log(`YouTube mode: ${YT_KEY ? 'API (exact live detection)' : 'RSS only (no key)'} | Kick mode: ${KICK_ID && KICK_SECRET ? 'official API' : 'unofficial endpoint'}`);
+  console.log(`YouTube mode: ${YT_ENABLED ? 'API-backed live detection' : 'disabled (missing YOUTUBE_API_KEY)'} | Kick mode: ${KICK_ENABLED ? 'API-backed live detection' : 'disabled (missing KICK_CLIENT_ID / KICK_CLIENT_SECRET)'}`);
   client.user.setActivity('over Purnima Gaming', { type: 3 });
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
