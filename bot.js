@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 const {
   Client,
   GatewayIntentBits,
@@ -10,6 +11,7 @@ const {
   Routes,
   SlashCommandBuilder,
   PermissionsBitField,
+  ChannelType,
   MessageFlags,
   Events
 } = require("discord.js");
@@ -19,22 +21,25 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 // ===============================
 // ENVIRONMENT VARIABLES
 // ===============================
+// Required:  DISCORD_TOKEN
+// Optional:  KICK_USERNAME, KICK_CLIENT_ID, KICK_CLIENT_SECRET
+//            YOUTUBE_API_KEY, YOUTUBE_CHANNEL_ID (starts with UC)
+//            DATA_DIR  (folder for state.json; point at a persistent disk on Render, e.g. /data)
+//            ANNOUNCEMENT_CHANNEL_ID / ANNOUNCEMENT_ROLE_ID  (optional: auto-configures that one server)
+// Each server picks its own channel + role with /setup.
 
 const {
   DISCORD_TOKEN,
   KICK_CLIENT_ID,
   KICK_CLIENT_SECRET,
   YOUTUBE_API_KEY,
-  ANNOUNCEMENT_CHANNEL_ID,
   KICK_USERNAME,
   YOUTUBE_CHANNEL_ID
 } = process.env;
 
-for (const key of ["DISCORD_TOKEN", "ANNOUNCEMENT_CHANNEL_ID"]) {
-  if (!process.env[key]) {
-    console.error(`Missing required env var: ${key}`);
-    process.exit(1);
-  }
+if (!DISCORD_TOKEN) {
+  console.error("Missing required env var: DISCORD_TOKEN");
+  process.exit(1);
 }
 
 const KICK_ENABLED = Boolean(KICK_USERNAME && KICK_CLIENT_ID && KICK_CLIENT_SECRET);
@@ -47,18 +52,9 @@ if (!YOUTUBE_ENABLED) console.warn("[YouTube] Disabled (need YOUTUBE_API_KEY and
 
 const CHECK_INTERVAL = 30 * 1000;
 const FETCH_TIMEOUT = 10 * 1000;
-
-// A stream counts as the "same" broadcast until it has been offline this long.
-// Stops re-announcements from API blips or a quick stream restart.
-const OFFLINE_RESET_MS = 10 * 60 * 1000;
-
-// The role is pinged at most once per this window, even if you go live on
-// Kick and YouTube at different times (the 2nd announcement is sent without a ping).
-const PING_COOLDOWN_MS = 15 * 60 * 1000;
-
-const COMMAND_ENABLEMENTS = {
-  recheck: process.env.ENABLE_RECHECK !== "false"
-};
+const OFFLINE_RESET_MS = 10 * 60 * 1000; // offline this long = next live is a new broadcast
+const PING_COOLDOWN_MS = 15 * 60 * 1000; // max one role ping per server per window
+const MANUAL_RECHECK_COOLDOWN_MS = 10 * 1000;
 
 function normalizeMentionRoleId(value) {
   if (!value) return null;
@@ -66,11 +62,18 @@ function normalizeMentionRoleId(value) {
   return /^\d{17,20}$/.test(id) ? id : null;
 }
 
-const ANNOUNCEMENT_ROLE_ID = normalizeMentionRoleId(process.env.ANNOUNCEMENT_ROLE_ID);
+// ===============================
+// KEEP-ALIVE HTTP SERVER (Render "Web Service" needs an open port)
+// ===============================
+
+if (process.env.PORT) {
+  http
+    .createServer((req, res) => res.end("ok"))
+    .listen(process.env.PORT, () => console.log(`HTTP keep-alive on port ${process.env.PORT}`));
+}
 
 // ===============================
 // SINGLE-INSTANCE LOCK
-// (two copies of the bot running = every announcement posted twice)
 // ===============================
 
 const LOCK_FILE = path.join(__dirname, "bot.lock");
@@ -80,23 +83,20 @@ function acquireLock() {
     const oldPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8"), 10);
     if (oldPid && oldPid !== process.pid) {
       try {
-        process.kill(oldPid, 0); // throws if the process doesn't exist
-        console.error(
-          `Another instance is already running (pid ${oldPid}). Stop it first, or delete bot.lock if it is stale.`
-        );
+        process.kill(oldPid, 0);
+        console.error(`Another instance is already running (pid ${oldPid}). Stop it or delete bot.lock.`);
         process.exit(1);
       } catch (e) {
         if (e.code === "EPERM") {
           console.error(`Another instance appears to be running (pid ${oldPid}).`);
           process.exit(1);
         }
-        /* ESRCH: stale lock, continue */
       }
     }
-  } catch {
-    /* no lock file */
-  }
-  fs.writeFileSync(LOCK_FILE, String(process.pid));
+  } catch {}
+  try {
+    fs.writeFileSync(LOCK_FILE, String(process.pid));
+  } catch {}
   const release = () => {
     try {
       if (parseInt(fs.readFileSync(LOCK_FILE, "utf8"), 10) === process.pid) fs.unlinkSync(LOCK_FILE);
@@ -110,36 +110,49 @@ function acquireLock() {
 acquireLock();
 
 // ===============================
-// STATE (persisted so restarts don't re-announce)
+// STATE (persisted)
 // ===============================
+// state.guilds[guildId] = { channelId, roleId, kickAnnounced, youtubeAnnounced, lastPingAt }
 
-const STATE_FILE = path.join(__dirname, "state.json");
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch {}
+const STATE_FILE = path.join(DATA_DIR, "state.json");
 
 const state = {
-  kick: { announced: false, lastLive: 0 },
-  youtube: { announced: false, lastLive: 0 },
-  lastPingAt: 0
+  kick: { lastLive: 0 },
+  youtube: { lastLive: 0 },
+  guilds: {}
 };
 
 try {
   const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   Object.assign(state.kick, saved.kick);
   Object.assign(state.youtube, saved.youtube);
-  state.lastPingAt = saved.lastPingAt || 0;
-
-  // migrate state.json written by the previous version
-  if (saved.kickAnnounced && !saved.kick) Object.assign(state.kick, { announced: true, lastLive: Date.now() });
-  if (saved.youtubeAnnounced && !saved.youtube) Object.assign(state.youtube, { announced: true, lastLive: Date.now() });
+  Object.assign(state.guilds, saved.guilds);
 } catch {
-  /* first run */
+  console.warn(`No saved state at ${STATE_FILE} (first run, or the disk was wiped).`);
 }
 
 function saveState() {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+    const tmp = STATE_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.renameSync(tmp, STATE_FILE);
   } catch (e) {
     console.error("Failed to save state:", e.message);
   }
+}
+
+function newGuildConfig(channelId, roleId) {
+  return {
+    channelId,
+    roleId: roleId || null,
+    kickAnnounced: false,
+    youtubeAnnounced: false,
+    lastPingAt: 0
+  };
 }
 
 let kickToken = null;
@@ -153,16 +166,7 @@ async function fetchTimeout(url, options = {}) {
   return fetch(url, { ...options, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
 }
 
-async function getAnnouncementChannel() {
-  const channel = await client.channels.fetch(ANNOUNCEMENT_CHANNEL_ID);
-  if (!channel || !channel.isTextBased() || typeof channel.send !== "function") {
-    throw new Error("Invalid announcement channel");
-  }
-  return channel;
-}
-
-// Extra safety net: if the bot already posted this link recently (e.g. from a
-// second instance on another machine), don't post it again.
+// Safety net against duplicates (e.g. a second instance, or lost state)
 async function alreadyPosted(channel, urls) {
   try {
     const messages = await channel.messages.fetch({ limit: 15 });
@@ -174,16 +178,7 @@ async function alreadyPosted(channel, urls) {
         m.embeds.some(e => e.url && urls.includes(e.url))
     );
   } catch {
-    return false; // missing Read Message History permission etc.
-  }
-}
-
-function trackLive(platformState, live) {
-  const now = Date.now();
-  if (live) {
-    platformState.lastLive = now;
-  } else if (platformState.announced && now - platformState.lastLive > OFFLINE_RESET_MS) {
-    platformState.announced = false;
+    return false;
   }
 }
 
@@ -262,9 +257,7 @@ function buildKickAnnouncement(channel) {
 }
 
 // ===============================
-// YOUTUBE
-// (uploads playlist + videos.list = ~2 quota units/check; search.list would
-// cost 100 units and exhaust the daily quota in under an hour)
+// YOUTUBE (uploads playlist + videos.list ≈ 2 quota units per check)
 // ===============================
 
 async function getYouTubeStatus() {
@@ -283,8 +276,7 @@ async function getYouTubeStatus() {
   let liveVideo = null;
   if (ids.length) {
     const vRes = await fetchTimeout(
-      "https://www.googleapis.com/youtube/v3/videos" +
-        `?part=snippet&id=${ids.join(",")}&key=${key}`
+      "https://www.googleapis.com/youtube/v3/videos" + `?part=snippet&id=${ids.join(",")}&key=${key}`
     );
     if (!vRes.ok) throw new Error(`YouTube videos API error: ${vRes.status}`);
     const v = await vRes.json();
@@ -309,10 +301,7 @@ function buildYouTubeAnnouncement(video) {
     .setAuthor({ name: `${snippet.channelTitle} is LIVE on YouTube` })
     .setTitle(title.slice(0, 256))
     .setURL(url)
-    .setDescription(
-      `🔴 **${snippet.channelTitle} is now live!**\n\n` +
-        `📺 **Watch the stream on YouTube**`
-    )
+    .setDescription(`🔴 **${snippet.channelTitle} is now live!**\n\n📺 **Watch the stream on YouTube**`)
     .setTimestamp()
     .setFooter({ text: "YouTube Live Notification" });
 
@@ -322,36 +311,57 @@ function buildYouTubeAnnouncement(video) {
 }
 
 // ===============================
-// ANNOUNCE (one message, one ping, even if both platforms go live together)
+// ANNOUNCE TO ONE SERVER
 // ===============================
 
-async function announce(pending) {
-  const channel = await getAnnouncementChannel();
+async function announceToGuild(guildId, config, pending) {
+  let channel;
+  try {
+    channel = await client.channels.fetch(config.channelId);
+  } catch (error) {
+    if (error.code === 10003 || error.code === 10004) {
+      console.warn(`[${guildId}] Channel no longer exists, removing server config`);
+      delete state.guilds[guildId];
+      return;
+    }
+    throw error;
+  }
+
+  if (!channel || !channel.isTextBased() || typeof channel.send !== "function") {
+    throw new Error("Configured channel is not a text channel");
+  }
+
+  const markDone = () => {
+    for (const p of pending) config[`${p.platform}Announced`] = true;
+  };
 
   if (await alreadyPosted(channel, pending.map(p => p.url))) {
-    console.log("Already announced recently in channel, skipping");
+    console.log(`[${guildId}] Already announced recently, skipping`);
+    markDone();
     return;
   }
 
   const now = Date.now();
-  const shouldPing = ANNOUNCEMENT_ROLE_ID && now - state.lastPingAt > PING_COOLDOWN_MS;
-  const mention = shouldPing ? `<@&${ANNOUNCEMENT_ROLE_ID}> ` : "";
+  const shouldPing = config.roleId && now - config.lastPingAt > PING_COOLDOWN_MS;
+  const mention = shouldPing ? `<@&${config.roleId}> ` : "";
 
   await channel.send({
     content: `${mention}${pending[0].title}`.slice(0, 2000),
     embeds: pending.map(p => p.embed),
-    allowedMentions: { roles: shouldPing ? [ANNOUNCEMENT_ROLE_ID] : [] }
+    allowedMentions: { roles: shouldPing ? [config.roleId] : [] }
   });
 
-  if (shouldPing) state.lastPingAt = now;
-  console.log(`Announcement sent: ${pending.map(p => p.platform).join(" + ")}`);
+  if (shouldPing) config.lastPingAt = now;
+  markDone();
+  console.log(`[${guildId}] Announcement sent: ${pending.map(p => p.platform).join(" + ")}`);
 }
 
 // ===============================
-// RECHECK (with overlap guard)
+// RECHECK
 // ===============================
 
 let checking = false;
+let lastManualRecheck = 0;
 
 async function recheck() {
   if (checking) {
@@ -368,38 +378,43 @@ async function recheck() {
       YOUTUBE_ENABLED ? getYouTubeStatus() : Promise.resolve(null)
     ]);
 
-    const pending = [];
+    const now = Date.now();
+    const live = {}; // platform -> announcement payload, for platforms currently live
 
-    // On an API error we leave that platform's state untouched
-    if (kickRes.status === "rejected") {
-      console.error("[Kick] Error:", kickRes.reason?.message);
-    } else if (kickRes.value) {
-      const { live, channel } = kickRes.value;
-      trackLive(state.kick, live);
-      if (live && !state.kick.announced) pending.push(buildKickAnnouncement(channel));
+    function handle(platform, result, build) {
+      if (result.status === "rejected") {
+        console.error(`[${platform}] Error:`, result.reason?.message);
+        return; // unknown status: leave state untouched
+      }
+      if (!result.value) return; // platform disabled
+
+      if (result.value.live) {
+        state[platform].lastLive = now;
+        live[platform] = build(result.value);
+      } else if (now - state[platform].lastLive > OFFLINE_RESET_MS) {
+        // offline long enough: next stream gets announced again in every server
+        for (const g of Object.values(state.guilds)) g[`${platform}Announced`] = false;
+      }
     }
 
-    if (ytRes.status === "rejected") {
-      console.error("[YouTube] Error:", ytRes.reason?.message);
-    } else if (ytRes.value) {
-      const { live, video } = ytRes.value;
-      trackLive(state.youtube, live);
-      if (live && !state.youtube.announced) pending.push(buildYouTubeAnnouncement(video));
+    handle("kick", kickRes, v => buildKickAnnouncement(v.channel));
+    handle("youtube", ytRes, v => buildYouTubeAnnouncement(v.video));
+
+    for (const [guildId, config] of Object.entries(state.guilds)) {
+      const pending = Object.keys(live)
+        .filter(platform => !config[`${platform}Announced`])
+        .map(platform => live[platform]);
+
+      if (!pending.length) continue;
+
+      try {
+        await announceToGuild(guildId, config, pending);
+      } catch (error) {
+        // other servers still get theirs; this one retries next check
+        console.error(`[${guildId}] Announcement failed (will retry):`, error.message);
+      }
     }
 
-    saveState();
-
-    if (!pending.length) return;
-
-    try {
-      await announce(pending);
-    } catch (error) {
-      console.error("Announcement failed (will retry next check):", error.message);
-      return;
-    }
-
-    // Mark as announced only after the send succeeded
-    for (const p of pending) state[p.platform].announced = true;
     saveState();
   } finally {
     checking = false;
@@ -411,33 +426,46 @@ async function recheck() {
 // ===============================
 
 const commands = [
-  COMMAND_ENABLEMENTS.recheck
-    ? new SlashCommandBuilder()
-        .setName("recheck")
-        .setDescription("Immediately check Kick and YouTube live status")
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
-    : null
-]
-  .filter(Boolean)
-  .map(c => c.toJSON());
+  new SlashCommandBuilder()
+    .setName("setup")
+    .setDescription("Choose where live announcements are posted in this server")
+    .addChannelOption(o =>
+      o
+        .setName("channel")
+        .setDescription("Channel for live announcements")
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+        .setRequired(true)
+    )
+    .addRoleOption(o => o.setName("role").setDescription("Role to ping (optional)"))
+    .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("remove")
+    .setDescription("Stop live announcements in this server")
+    .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("recheck")
+    .setDescription("Immediately check Kick and YouTube live status")
+    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
+].map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
-  if (client.guilds.cache.size === 0) {
-    console.error("No Discord server found. Make sure the bot is invited to a server.");
-    return;
+  try {
+    // Global commands: every server (including new ones) gets them automatically
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log("Global slash commands registered");
+  } catch (error) {
+    console.error("Failed to register slash commands:", error);
   }
 
+  // Clear leftover per-server commands from older versions (avoids duplicate /recheck)
   for (const guild of client.guilds.cache.values()) {
     try {
-      await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), {
-        body: commands
-      });
-      console.log(`Slash commands registered in ${guild.name} (${guild.id})`);
-    } catch (error) {
-      console.error(`Failed to register slash commands in ${guild.name}:`, error);
-    }
+      await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: [] });
+    } catch {}
   }
 }
 
@@ -451,43 +479,145 @@ client.once(Events.ClientReady, async () => {
   if (started) return;
   started = true;
 
-  console.log(`Logged in as ${client.user.tag}`);
+  console.log(`Logged in as ${client.user.tag} (in ${client.guilds.cache.size} servers)`);
 
   await registerCommands();
-  await recheck();
 
+  // Optional: auto-configure one server from env vars
+  if (process.env.ANNOUNCEMENT_CHANNEL_ID) {
+    try {
+      const ch = await client.channels.fetch(process.env.ANNOUNCEMENT_CHANNEL_ID);
+      if (ch?.guildId && !state.guilds[ch.guildId]) {
+        state.guilds[ch.guildId] = newGuildConfig(
+          ch.id,
+          normalizeMentionRoleId(process.env.ANNOUNCEMENT_ROLE_ID)
+        );
+        saveState();
+        console.log(`Auto-configured ${ch.guild.name} from environment variables`);
+      }
+    } catch (e) {
+      console.error("ANNOUNCEMENT_CHANNEL_ID could not be used:", e.message);
+    }
+  }
+
+  await recheck();
   setInterval(recheck, CHECK_INTERVAL);
 
-  console.log("Kick + YouTube checker started");
-  console.log("Checking every 30 seconds");
+  console.log("Kick + YouTube checker started (every 30 seconds)");
+});
+
+client.on(Events.GuildDelete, guild => {
+  if (guild.available === false) return; // outage, not a real removal
+  if (state.guilds[guild.id]) {
+    delete state.guilds[guild.id];
+    saveState();
+    console.log(`Removed config for ${guild.id}`);
+  }
 });
 
 // ===============================
 // INTERACTIONS
 // ===============================
 
+async function handleSetup(interaction) {
+  const channel = interaction.options.getChannel("channel", true);
+  const role = interaction.options.getRole("role");
+  const me = interaction.guild.members.me;
+
+  const perms = channel.permissionsFor(me);
+  const missing = ["ViewChannel", "SendMessages", "EmbedLinks"].filter(
+    p => !perms?.has(PermissionsBitField.Flags[p])
+  );
+
+  if (missing.length) {
+    return interaction.reply({
+      content: `❌ I'm missing these permissions in ${channel}: **${missing.join(", ")}**. Fix that and run /setup again.`,
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const existing = state.guilds[interaction.guildId];
+  state.guilds[interaction.guildId] = {
+    ...newGuildConfig(channel.id, role?.id),
+    // keep dedupe flags if only the channel/role changed mid-stream
+    kickAnnounced: existing?.kickAnnounced || false,
+    youtubeAnnounced: existing?.youtubeAnnounced || false,
+    lastPingAt: existing?.lastPingAt || 0
+  };
+  saveState();
+
+  let note = "";
+  if (role && !role.mentionable && !me.permissions.has(PermissionsBitField.Flags.MentionEveryone)) {
+    note =
+      "\n⚠️ That role isn't mentionable and I lack the **Mention Everyone** permission, so the ping won't work. Make the role mentionable or grant me that permission.";
+  }
+
+  await interaction.reply({
+    content:
+      `✅ Live announcements will be posted in ${channel}` +
+      (role ? ` and ping ${role}.` : " with no role ping.") +
+      note,
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] }
+  });
+}
+
+async function handleRemove(interaction) {
+  if (!state.guilds[interaction.guildId]) {
+    return interaction.reply({
+      content: "This server isn't set up yet. Use /setup first.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+  delete state.guilds[interaction.guildId];
+  saveState();
+  await interaction.reply({
+    content: "✅ Live announcements disabled for this server.",
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+async function handleRecheck(interaction) {
+  if (Date.now() - lastManualRecheck < MANUAL_RECHECK_COOLDOWN_MS) {
+    return interaction.reply({
+      content: "⏳ A check just ran. Try again in a few seconds.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+  lastManualRecheck = Date.now();
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  await recheck();
+  await interaction.editReply("✅ Kick and YouTube status checked.");
+}
+
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== "recheck") return;
 
   try {
-    if (!COMMAND_ENABLEMENTS.recheck) {
+    if (!interaction.inGuild()) {
       return await interaction.reply({
-        content: "❌ This command is disabled.",
+        content: "These commands only work inside a server.",
         flags: MessageFlags.Ephemeral
       });
     }
 
-    if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
+    // Defense in depth: Discord already hides these, but verify server-side too
+    const needed =
+      interaction.commandName === "recheck"
+        ? PermissionsBitField.Flags.Administrator
+        : PermissionsBitField.Flags.ManageGuild;
+
+    if (!interaction.memberPermissions?.has(needed)) {
       return await interaction.reply({
-        content: "❌ Administrator permission required.",
+        content: "❌ You don't have permission to use this command.",
         flags: MessageFlags.Ephemeral
       });
     }
 
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    await recheck();
-    await interaction.editReply("✅ Kick and YouTube status checked.");
+    if (interaction.commandName === "setup") return await handleSetup(interaction);
+    if (interaction.commandName === "remove") return await handleRemove(interaction);
+    if (interaction.commandName === "recheck") return await handleRecheck(interaction);
   } catch (error) {
     console.error("Interaction error:", error);
     try {
@@ -496,9 +626,7 @@ client.on(Events.InteractionCreate, async interaction => {
       } else {
         await interaction.reply({ content: "❌ Something went wrong.", flags: MessageFlags.Ephemeral });
       }
-    } catch {
-      /* interaction expired */
-    }
+    } catch {}
   }
 });
 
