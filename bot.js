@@ -54,9 +54,11 @@ let kickTokenExpiresAt = 0;
 
 let kickLive = false;
 let lastKickSessionId = null;
+let lastKickAnnouncementKey = null;
 
 let youtubeLive = false;
 let lastYoutubeVideoId = null;
+let lastYoutubeAnnouncementKey = null;
 
 // ===============================
 // DISCORD CHANNEL
@@ -177,6 +179,7 @@ async function checkKick() {
     if (!isLive) {
       kickLive = false;
       lastKickSessionId = null;
+      lastKickAnnouncementKey = null;
       return;
     }
 
@@ -186,15 +189,19 @@ async function checkKick() {
       stream?.session_id ||
       `${KICK_USERNAME}-live`;
 
+    const announcementKey = `${KICK_USERNAME}:${sessionId}`;
+
     if (
       kickLive &&
-      lastKickSessionId === sessionId
+      lastKickSessionId === sessionId &&
+      lastKickAnnouncementKey === announcementKey
     ) {
       return;
     }
 
     kickLive = true;
     lastKickSessionId = sessionId;
+    lastKickAnnouncementKey = announcementKey;
 
     await announceKick(channel);
 
@@ -320,6 +327,7 @@ async function checkYouTube() {
 
       youtubeLive = false;
       lastYoutubeVideoId = null;
+      lastYoutubeAnnouncementKey = null;
 
       return;
     }
@@ -331,19 +339,23 @@ async function checkYouTube() {
       return;
     }
 
+    const announcementKey = `${YOUTUBE_CHANNEL_ID}:${videoId}`;
+
     console.log(
       `[YouTube] LIVE: ${videoId}`
     );
 
     if (
       youtubeLive &&
-      lastYoutubeVideoId === videoId
+      lastYoutubeVideoId === videoId &&
+      lastYoutubeAnnouncementKey === announcementKey
     ) {
       return;
     }
 
     youtubeLive = true;
     lastYoutubeVideoId = videoId;
+    lastYoutubeAnnouncementKey = announcementKey;
 
     await announceYouTube(
       liveVideo
