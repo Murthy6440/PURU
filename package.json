@@ -1,17 +1,8 @@
 {
-  "name": "puru",
+  "name": "live-announcer",
   "version": "1.0.0",
-  "description": "Purnima Gaming Discord moderation + YouTube/Kick announcement bot",
-  "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "license": "MIT",
-  "dependencies": {
-    "discord.js": "^14.16.0",
-    "dotenv": "^16.4.5"
-  }
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "discord.js": "^14.16.0" }
 }
