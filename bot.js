@@ -59,6 +59,19 @@ const MANUAL_RECHECK_COOLDOWN_MS = 10 * 1000;
 const ENABLE_KICK_COMMAND = process.env.ENABLE_KICK_COMMAND !== "false";
 const ENABLE_YOUTUBE_COMMAND = process.env.ENABLE_YOUTUBE_COMMAND !== "false";
 
+// While a stream is live, re-post the announcement every N minutes (0 = never repeat).
+// Each server can override this with /setup repeat_minutes.
+const MIN_REPEAT_MINUTES = 15;
+const parsedRepeat = parseInt(process.env.REPEAT_MINUTES ?? "60", 10);
+const DEFAULT_REPEAT_MINUTES =
+  Number.isFinite(parsedRepeat) && parsedRepeat > 0 ? Math.max(parsedRepeat, MIN_REPEAT_MINUTES) : 0;
+const REPEAT_PING = process.env.REPEAT_PING !== "false"; // ping the role on repeats too
+
+function getRepeatMs(config) {
+  const minutes = config.repeatMinutes ?? DEFAULT_REPEAT_MINUTES;
+  return minutes > 0 ? minutes * 60 * 1000 : 0;
+}
+
 function normalizeMentionRoleId(value) {
   if (!value) return null;
   const id = String(value).trim().replace(/^<@&?|>|@/g, "").trim();
@@ -154,6 +167,9 @@ function newGuildConfig(channelId, roleId) {
     roleId: roleId || null,
     kickAnnounced: false,
     youtubeAnnounced: false,
+    kickLastAt: 0,
+    youtubeLastAt: 0,
+    repeatMinutes: null, // null = use REPEAT_MINUTES default
     lastPingAt: 0
   };
 }
@@ -169,20 +185,27 @@ async function fetchTimeout(url, options = {}) {
   return fetch(url, { ...options, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
 }
 
-// Safety net against duplicates (e.g. a second instance, or lost state)
-async function alreadyPosted(channel, urls) {
+// Safety net that survives restarts, redeploys and a wiped state.json:
+// look at what the bot itself already posted in the channel and see whether it
+// covers THIS broadcast. `since` is the broadcast's start time, so an old
+// announcement from a previous stream doesn't count, but one for the current
+// stream does, no matter how long ago it was posted.
+async function findPosted(channel, pending) {
+  const posted = new Map(); // platform -> timestamp of newest matching post
   try {
-    const messages = await channel.messages.fetch({ limit: 15 });
-    const cutoff = Date.now() - OFFLINE_RESET_MS;
-    return messages.some(
-      m =>
-        m.author.id === client.user.id &&
-        m.createdTimestamp > cutoff &&
-        m.embeds.some(e => e.url && urls.includes(e.url))
-    );
+    const messages = await channel.messages.fetch({ limit: 50 });
+    for (const m of messages.values()) {
+      if (m.author.id !== client.user.id) continue;
+      for (const p of pending) {
+        if (m.createdTimestamp >= p.since && m.embeds.some(e => e.url === p.url)) {
+          posted.set(p.platform, Math.max(posted.get(p.platform) || 0, m.createdTimestamp));
+        }
+      }
+    }
   } catch {
-    return false;
+    // missing Read Message History permission etc.: fall back to saved state only
   }
+  return posted;
 }
 
 // ===============================
@@ -256,7 +279,11 @@ function buildKickAnnouncement(channel) {
 
   if (thumbnail) embed.setImage(thumbnail);
 
-  return { platform: "kick", title, url, embed };
+  // Broadcast start (minus slack). Without start_time, assume the last 6 hours.
+  const start = Date.parse(stream.start_time);
+  const since = Number.isFinite(start) ? start - 2 * 60 * 1000 : Date.now() - 6 * 60 * 60 * 1000;
+
+  return { platform: "kick", title, url, embed, since };
 }
 
 // ===============================
@@ -310,7 +337,8 @@ function buildYouTubeAnnouncement(video) {
 
   if (thumbnail) embed.setImage(thumbnail);
 
-  return { platform: "youtube", title, url, embed };
+  // The URL contains the unique video ID, so any earlier post of it is the same stream
+  return { platform: "youtube", title, url, embed, since: 0 };
 }
 
 // ===============================
@@ -334,22 +362,40 @@ async function announceToGuild(guildId, config, pending) {
     throw new Error("Configured channel is not a text channel");
   }
 
-  const markDone = () => {
-    for (const p of pending) config[`${p.platform}Announced`] = true;
-  };
+  // First announcement of a broadcast: check the channel history so a restart or
+  // wiped state.json doesn't announce it again. Repeats skip this check on purpose.
+  const fresh = pending.filter(p => !p.isRepeat);
+  if (fresh.length) {
+    const posted = await findPosted(channel, fresh);
+    for (const [platform, ts] of posted) {
+      config[`${platform}Announced`] = true;
+      config[`${platform}LastAt`] = Math.max(config[`${platform}LastAt`] || 0, ts);
+    }
+    pending = pending.filter(p => p.isRepeat || !posted.has(p.platform));
+  }
 
-  if (await alreadyPosted(channel, pending.map(p => p.url))) {
-    console.log(`[${guildId}] Already announced recently, skipping`);
-    markDone();
+  if (!pending.length) {
+    console.log(`[${guildId}] Nothing new to announce`);
     return;
   }
 
+  const markDone = () => {
+    const t = Date.now();
+    for (const p of pending) {
+      config[`${p.platform}Announced`] = true;
+      config[`${p.platform}LastAt`] = t;
+    }
+  };
+
   const now = Date.now();
-  const shouldPing = config.roleId && now - config.lastPingAt > PING_COOLDOWN_MS;
+  const allRepeat = pending.every(p => p.isRepeat);
+  const pingAllowed = !allRepeat || REPEAT_PING;
+  const shouldPing = pingAllowed && config.roleId && now - config.lastPingAt > PING_COOLDOWN_MS;
   const mention = shouldPing ? `<@&${config.roleId}> ` : "";
+  const prefix = allRepeat ? "🔁 Still live! " : "";
 
   await channel.send({
-    content: `${mention}${pending[0].title}`.slice(0, 2000),
+    content: `${mention}${prefix}${pending[0].title}`.slice(0, 2000),
     embeds: pending.map(p => p.embed),
     allowedMentions: { roles: shouldPing ? [config.roleId] : [] }
   });
@@ -404,9 +450,19 @@ async function recheck() {
     handle("youtube", ytRes, v => buildYouTubeAnnouncement(v.video));
 
     for (const [guildId, config] of Object.entries(state.guilds)) {
+      const repeatMs = getRepeatMs(config);
+
       const pending = Object.keys(live)
-        .filter(platform => !config[`${platform}Announced`])
-        .map(platform => live[platform]);
+        .map(platform => {
+          if (!config[`${platform}Announced`]) return { ...live[platform], isRepeat: false };
+
+          // Missing timestamp (older saved state): start the repeat clock now
+          const lastAt = config[`${platform}LastAt`] || (config[`${platform}LastAt`] = now);
+          if (repeatMs > 0 && now - lastAt >= repeatMs) return { ...live[platform], isRepeat: true };
+
+          return null;
+        })
+        .filter(Boolean);
 
       if (!pending.length) continue;
 
@@ -440,6 +496,13 @@ const commands = [
         .setRequired(true)
     )
     .addRoleOption(o => o.setName("role").setDescription("Role to ping (optional)"))
+    .addIntegerOption(o =>
+      o
+        .setName("repeat_minutes")
+        .setDescription("Re-post the announcement every N minutes while live (0 = never, min 15)")
+        .setMinValue(0)
+        .setMaxValue(1440)
+    )
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
 
   new SlashCommandBuilder()
@@ -463,22 +526,37 @@ const commands = [
   .filter(Boolean)
   .map(c => c.toJSON());
 
-async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
+// Per-server registration shows up in Discord instantly (global commands can lag)
+async function registerGuildCommands(guild) {
   try {
-    // Global commands: every server (including new ones) gets them automatically
-    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-    console.log("Global slash commands registered");
+    await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: commands });
+    console.log(
+      `Slash commands registered in ${guild.name} (${guild.id}): ${commands.map(c => "/" + c.name).join(", ")}`
+    );
   } catch (error) {
-    console.error("Failed to register slash commands:", error);
+    if (error.code === 50001) {
+      console.error(
+        `[${guild.name}] Missing Access: the bot was invited without the applications.commands scope. Re-invite it using the link with scope=bot%20applications.commands.`
+      );
+    } else {
+      console.error(`[${guild.name}] Failed to register slash commands:`, error.message);
+    }
+  }
+}
+
+async function registerCommands() {
+  // Remove global commands from the previous version so nothing shows up twice
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+    console.log("Cleared old global commands");
+  } catch (error) {
+    console.error("Failed to clear global commands:", error.message);
   }
 
-  // Clear leftover per-server commands from older versions (avoids duplicate /recheck)
   for (const guild of client.guilds.cache.values()) {
-    try {
-      await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: [] });
-    } catch {}
+    await registerGuildCommands(guild);
   }
 }
 
@@ -519,6 +597,11 @@ client.once(Events.ClientReady, async () => {
   console.log("Kick + YouTube checker started (every 30 seconds)");
 });
 
+client.on(Events.GuildCreate, guild => {
+  console.log(`Joined server ${guild.name} (${guild.id})`);
+  registerGuildCommands(guild);
+});
+
 client.on(Events.GuildDelete, guild => {
   if (guild.available === false) return; // outage, not a real removal
   if (state.guilds[guild.id]) {
@@ -550,13 +633,27 @@ async function handleSetup(interaction) {
   }
 
   const existing = state.guilds[interaction.guildId];
+
+  const repeatOpt = interaction.options.getInteger("repeat_minutes");
+  let repeatMinutes = existing?.repeatMinutes ?? null;
+  if (repeatOpt !== null) repeatMinutes = repeatOpt === 0 ? 0 : Math.max(repeatOpt, MIN_REPEAT_MINUTES);
+
   state.guilds[interaction.guildId] = {
     ...newGuildConfig(channel.id, role?.id),
     // keep dedupe flags if only the channel/role changed mid-stream
     kickAnnounced: existing?.kickAnnounced || false,
     youtubeAnnounced: existing?.youtubeAnnounced || false,
+    kickLastAt: existing?.kickLastAt || 0,
+    youtubeLastAt: existing?.youtubeLastAt || 0,
+    repeatMinutes,
     lastPingAt: existing?.lastPingAt || 0
   };
+
+  const effectiveRepeat = repeatMinutes ?? DEFAULT_REPEAT_MINUTES;
+  const repeatText =
+    effectiveRepeat > 0
+      ? ` While live, it re-posts every ${effectiveRepeat} minutes.`
+      : " It won't repeat while you're live.";
   saveState();
 
   let note = "";
@@ -569,6 +666,7 @@ async function handleSetup(interaction) {
     content:
       `✅ Live announcements will be posted in ${channel}` +
       (role ? ` and ping ${role}.` : " with no role ping.") +
+      repeatText +
       note,
     flags: MessageFlags.Ephemeral,
     allowedMentions: { parse: [] }
