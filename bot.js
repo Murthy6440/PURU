@@ -4,6 +4,12 @@
 // ENV (rename below if yours differ):
 //   DISCORD_TOKEN, KICK_CLIENT_ID, KICK_CLIENT_SECRET, YOUTUBE_API_KEY
 //   DATA_DIR (optional, point to a Render Disk mount, e.g. /data)
+//
+// Commands:
+//   /kickadd user channel ping      /youtubeadd user channel ping
+//   /kick remove user               /youtube remove user
+//   /kick disable user              /youtube disable user
+//   /kick recheck [user]            /youtube recheck [user]
 
 const fs = require('fs');
 const path = require('path');
@@ -20,8 +26,9 @@ const {
 const POLL_MS = 30_000;
 const OFFLINE_STRIKES_TO_RESET = 2; // avoids re-announcing on short stream drops
 const DB_FILE = path.join(DATA_DIR, 'streamers.json');
-const COLORS = { kick: 0x53fc18, youtube: 0xff0000, ok: 0x2ecc71, off: 0x95a5a6, err: 0xe74c3c };
+const COLORS = { kick: 0x53fc18, youtube: 0xff0000, ok: 0x2ecc71, off: 0x95a5a6, err: 0xe74c3c, info: 0x5865f2 };
 const NAMES = { kick: 'Kick', youtube: 'YouTube' };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ───────────── storage (tiny JSON db) ───────────── */
 let db = [];
@@ -131,7 +138,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 async function announce(entry, info) {
   const channel = await client.channels.fetch(entry.channelId).catch(() => null);
-  if (!channel?.isTextBased()) return console.warn('Channel missing for', entry.username);
+  if (!channel?.isTextBased()) throw new Error(`Channel missing for ${entry.username}`);
 
   const p = NAMES[entry.platform];
   const embed = new EmbedBuilder()
@@ -159,56 +166,10 @@ async function announce(entry, info) {
   });
 }
 
-/* ───────────── polling ───────────── */
-let polling = false;
-async function poll() {
-  if (polling) return; // never overlap runs → no duplicate sends
-  polling = true;
-  try {
-    const active = db.filter(e => e.enabled);
-
-    // Kick
-    const kickEntries = active.filter(e => e.platform === 'kick');
-    if (kickEntries.length) {
-      try {
-        const data = await kickFetch([...new Set(kickEntries.map(e => e.username))]);
-        for (const e of kickEntries) {
-          const c = data.get(e.username);
-          if (!c) continue;
-          const s = c.stream;
-          await handleState(e, !!s?.is_live, s?.start_time || String(Date.now()), () => ({
-            name: e.display || e.username,
-            title: c.stream_title,
-            category: c.category?.name,
-            image: s.thumbnail ? `${s.thumbnail}${s.thumbnail.includes('?') ? '&' : '?'}t=${Date.now()}` : null,
-            url: `https://kick.com/${e.username}`,
-          }));
-        }
-      } catch (err) { console.error('Kick poll:', err.message); }
-    }
-
-    // YouTube
-    const ytEntries = active.filter(e => e.platform === 'youtube');
-    if (ytEntries.length) {
-      try {
-        const live = await ytFetchLive([...new Set(ytEntries.map(e => e.channelId))]);
-        for (const e of ytEntries) {
-          const v = live.get(e.channelId);
-          await handleState(e, !!v, v?.id, () => ({
-            name: e.display || e.username,
-            title: v.snippet.title,
-            avatar: e.avatar,
-            image: `https://i.ytimg.com/vi/${v.id}/maxresdefault_live.jpg?t=${Date.now()}`,
-            url: `https://www.youtube.com/watch?v=${v.id}`,
-          }));
-        }
-      } catch (err) { console.error('YouTube poll:', err.message); }
-    }
-  } finally { polling = false; }
-}
-
-// Announce ONLY on offline → live with a new stream key.
+/* ───────────── checking (shared by the 30s poll AND /recheck) ───────────── */
+// Announce ONLY on offline → live with a new stream key. Returns true if a message was sent.
 async function handleState(entry, isLive, streamKey, buildInfo) {
+  let announced = false;
   if (isLive) {
     entry.offlineStrikes = 0;
     if (!entry.live || entry.lastKey !== streamKey) {
@@ -217,13 +178,73 @@ async function handleState(entry, isLive, streamKey, buildInfo) {
       entry.lastKey = streamKey;
       save(); // persist BEFORE sending → a crash/restart can't cause a repeat
       if (isNew) {
-        try { await announce(entry, buildInfo()); } catch (e) { console.error('Announce failed:', e.message); }
+        try { await announce(entry, buildInfo()); announced = true; }
+        catch (e) { console.error('Announce failed:', e.message); }
       }
     }
   } else if (entry.live) {
     entry.offlineStrikes = (entry.offlineStrikes || 0) + 1;
     if (entry.offlineStrikes >= OFFLINE_STRIKES_TO_RESET) { entry.live = false; save(); }
   }
+  return announced;
+}
+
+// Checks the given entries once. Returns { results: [{entry, live, announced}], errors: [string] }
+async function checkEntries(entries) {
+  const results = [];
+  const errors = [];
+
+  const kickEntries = entries.filter(e => e.platform === 'kick');
+  if (kickEntries.length) {
+    try {
+      const data = await kickFetch([...new Set(kickEntries.map(e => e.username))]);
+      for (const e of kickEntries) {
+        const c = data.get(e.username);
+        if (!c) { errors.push(`Kick: ${e.display || e.username} not found`); continue; }
+        const s = c.stream;
+        const announced = await handleState(e, !!s?.is_live, s?.start_time || String(Date.now()), () => ({
+          name: e.display || e.username,
+          title: c.stream_title,
+          category: c.category?.name,
+          image: s.thumbnail ? `${s.thumbnail}${s.thumbnail.includes('?') ? '&' : '?'}t=${Date.now()}` : null,
+          url: `https://kick.com/${e.username}`,
+        }));
+        results.push({ entry: e, live: !!s?.is_live, announced });
+      }
+    } catch (err) { errors.push(`Kick: ${err.message}`); }
+  }
+
+  const ytEntries = entries.filter(e => e.platform === 'youtube');
+  if (ytEntries.length) {
+    try {
+      const live = await ytFetchLive([...new Set(ytEntries.map(e => e.channelId))]);
+      for (const e of ytEntries) {
+        const v = live.get(e.channelId);
+        const announced = await handleState(e, !!v, v?.id, () => ({
+          name: e.display || e.username,
+          title: v.snippet.title,
+          avatar: e.avatar,
+          image: `https://i.ytimg.com/vi/${v.id}/maxresdefault_live.jpg?t=${Date.now()}`,
+          url: `https://www.youtube.com/watch?v=${v.id}`,
+        }));
+        results.push({ entry: e, live: !!v, announced });
+      }
+    } catch (err) { errors.push(`YouTube: ${err.message}`); }
+  }
+  return { results, errors };
+}
+
+// One check at a time (poll + manual rechecks can never overlap → no duplicate sends)
+let busy = false;
+async function runExclusive(entries) {
+  while (busy) await sleep(300);
+  busy = true;
+  try { return await checkEntries(entries); } finally { busy = false; }
+}
+async function poll() {
+  if (busy) return; // previous run still going — skip this tick
+  const { errors } = await runExclusive(db.filter(e => e.enabled));
+  errors.forEach(e => console.error('Poll error:', e));
 }
 
 /* ───────────── commands ───────────── */
@@ -246,7 +267,9 @@ const groupCmd = (name, platform) =>
     .addSubcommand(s => s.setName('remove').setDescription('Stop tracking and delete a streamer')
       .addStringOption(o => userOpt(o, 'Streamer name')))
     .addSubcommand(s => s.setName('disable').setDescription('Pause alerts (re-run the add command to resume)')
-      .addStringOption(o => userOpt(o, 'Streamer name')));
+      .addStringOption(o => userOpt(o, 'Streamer name')))
+    .addSubcommand(s => s.setName('recheck').setDescription('Check right now if streamers are live')
+      .addStringOption(o => o.setName('user').setDescription('Streamer name (leave empty to check everyone)')));
 
 const commands = [
   addCmd('kickadd', 'Kick', 'Kick username'),
@@ -258,6 +281,20 @@ const commands = [
 const reply = (i, color, text) =>
   i.reply({ embeds: [new EmbedBuilder().setColor(color).setDescription(text)], flags: MessageFlags.Ephemeral });
 
+// turn typed input into the stored key for this platform
+async function resolveKey(guildId, platform, input) {
+  let key = clean(input);
+  if (platform === 'youtube' && !/^uc[\w-]{22}$/.test(key)) {
+    const norm = s => s.toLowerCase().replace(/\s/g, '');
+    const hit = db.find(e => e.guildId === guildId && e.platform === 'youtube'
+      && (norm(e.display) === norm(key)));
+    if (hit) return hit.username;
+    const r = await resolveYouTube(input).catch(() => null);
+    if (r) key = r.channelId.toLowerCase();
+  }
+  return key;
+}
+
 client.on(Events.InteractionCreate, async i => {
   if (!i.isChatInputCommand() || !i.guildId) return;
   try {
@@ -265,6 +302,7 @@ client.on(Events.InteractionCreate, async i => {
     const platform = i.commandName.startsWith('kick') ? 'kick' : 'youtube';
     const p = NAMES[platform];
 
+    /* ── /kickadd | /youtubeadd ── */
     if (isAdd) {
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       const input = i.options.getString('user', true);
@@ -299,20 +337,54 @@ client.on(Events.InteractionCreate, async i => {
         `✅ **${entry.display}** added on ${p}\n📢 Channel: <#${channel.id}>\n🔔 Ping: ${ping}\n⏱️ Checked every 30 seconds`);
     }
 
-    // /kick | /youtube  →  remove | disable
+    /* ── /kick | /youtube → remove | disable | recheck ── */
     const sub = i.options.getSubcommand(false);
     if (!sub) {
       return reply(i, COLORS.err, '⚠️ This command is outdated. Please restart Discord (Ctrl+R) and try again.');
     }
-    const input = i.options.getString('user', true);
-    let key = clean(input);
-    if (platform === 'youtube' && !/^uc[\w-]{22}$/.test(key)) {
-      // allow matching by saved display name / handle
-      const hit = db.find(e => e.guildId === i.guildId && e.platform === 'youtube'
-        && (e.display.toLowerCase() === key || e.display.toLowerCase().replace(/\s/g, '') === key.replace(/\s/g, '')));
-      if (hit) key = hit.username;
-      else { const r = await resolveYouTube(input).catch(() => null); if (r) key = r.channelId.toLowerCase(); }
+
+    // recheck
+    if (sub === 'recheck') {
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const input = i.options.getString('user');
+      let list = db.filter(e => e.guildId === i.guildId && e.platform === platform);
+
+      if (input) {
+        const key = await resolveKey(i.guildId, platform, input);
+        list = list.filter(e => e.username === key);
+        if (!list.length) {
+          return i.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.err)
+            .setDescription(`❌ **${input}** isn't being tracked on ${p}.`)] });
+        }
+      }
+      if (!list.length) {
+        return i.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.off)
+          .setDescription(`No ${p} streamers added yet. Use \`/${platform}add\` first.`)] });
+      }
+
+      const paused = list.filter(e => !e.enabled);
+      const { results, errors } = await runExclusive(list.filter(e => e.enabled));
+
+      const lines = [
+        ...results.map(r => {
+          const name = `**${r.entry.display}**`;
+          if (!r.live) return `⚫ ${name} — offline`;
+          return r.announced ? `🔴 ${name} — live · announcement sent` : `🔴 ${name} — live · already announced`;
+        }),
+        ...paused.map(e => `⏸️ **${e.display}** — disabled`),
+        ...errors.map(e => `⚠️ ${e}`),
+      ];
+      return i.editReply({ embeds: [new EmbedBuilder()
+        .setColor(COLORS[platform])
+        .setTitle(`${p} recheck`)
+        .setDescription(lines.join('\n') || 'Nothing to check.')
+        .setFooter({ text: 'Only new streams get announced — no duplicates' })
+        .setTimestamp()] });
     }
+
+    // remove | disable
+    const input = i.options.getString('user', true);
+    const key = await resolveKey(i.guildId, platform, input);
     const entry = find(i.guildId, platform, key);
     if (!entry) return reply(i, COLORS.err, `❌ **${input}** isn't being tracked on ${p}.`);
 
