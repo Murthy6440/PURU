@@ -532,7 +532,7 @@ async function pollKick() {
 }
 
 // ───────────────────────── Boot ─────────────────────────
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`YouTube mode: ${YT_KEY ? 'API (exact live detection)' : 'RSS only (no key)'} | Kick mode: ${KICK_ID && KICK_SECRET ? 'official API' : 'unofficial endpoint'}`);
   client.user.setActivity('over Purnima Gaming', { type: 3 });
