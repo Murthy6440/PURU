@@ -12,7 +12,7 @@ require('dotenv').config();
 const fs = require('fs');
 const {
   Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits,
-  EmbedBuilder, ChannelType, MessageFlags,
+  EmbedBuilder, ChannelType, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle,
 } = require('discord.js');
 
 // ───────────────────────── Settings ─────────────────────────
@@ -21,7 +21,9 @@ const FOOTER_TEXT = 'Purnima Gaming • Discord Bot';
 const COLORS = { main: 0x7c3aed, ok: 0x22c55e, warn: 0xf59e0b, red: 0xef4444, yt: 0xff0000, kick: 0x53fc18 };
 const AUTO_MUTE_AT = 3;                 // auto-timeout when a user reaches this many warnings
 const AUTO_MUTE_MS = 60 * 60 * 1000;    // 1 hour
-const POLL_MS = 30 * 1000; // YouTube + Kick check interval
+const KICK_POLL_INTERVAL_MS = 30 * 1000;
+const YOUTUBE_POLL_INTERVAL_MS = 30 * 1000;
+const POLL_MS = KICK_POLL_INTERVAL_MS; // compatibility with the existing polling logic
 const LOG_FEATURES = [
   { name: 'Moderation', value: 'moderation' },
   { name: 'YouTube announcements', value: 'youtube' },
@@ -118,6 +120,7 @@ const userOpt = (o) => o.setName('user').setDescription('Target user').setRequir
 const commands = [
   new SlashCommandBuilder().setName('help').setDescription('View bot commands and categories'),
   new SlashCommandBuilder().setName('rechecklive').setDescription('Immediately re-check all configured live channels'),
+  new SlashCommandBuilder().setName('streamcheck').setDescription('Check all configured streams immediately'),
   new SlashCommandBuilder().setName('warn').setDescription('Warn a member')
     .addUserOption(userOpt).addStringOption((o) => reasonOpt(o).setRequired(true)),
   new SlashCommandBuilder().setName('warnings').setDescription('View a member\'s warnings').addUserOption(userOpt),
@@ -163,7 +166,7 @@ const commands = [
     .addSubcommand((s) => s.setName('add').setDescription('Add a mod role').addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true)))
     .addSubcommand((s) => s.setName('remove').setDescription('Remove a mod role').addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true)))
     .addSubcommand((s) => s.setName('list').setDescription('List mod roles')),
-].map((c) => c.setDefaultMemberPermissions(modPerm).setDMPermission(false).toJSON());
+].map((c) => c.setDefaultMemberPermissions(c.name === 'streamcheck' ? PermissionFlagsBits.Administrator : modPerm).setDMPermission(false).toJSON());
 
 // ───────────────────────── Handlers ─────────────────────────
 const H = {
@@ -173,7 +176,7 @@ const H = {
       { name: '⚙️ CONFIGURATION', value: '/setlogs\n/setannounce\n/antiping\n/modrole', inline: false },
       { name: '📺 YOUTUBE', value: '/youtube add\n/youtube remove\n/youtube list', inline: false },
       { name: '🟢 KICK', value: '/kicklive add\n/kicklive remove\n/kicklive list', inline: false },
-      { name: '🔧 UTILITY', value: '/help\n/rechecklive', inline: false },
+      { name: '🔧 UTILITY', value: '/help\n/rechecklive\n/streamcheck', inline: false },
     ];
 
     const e = new EmbedBuilder()
@@ -217,6 +220,28 @@ const H = {
     } catch (error) {
       console.error('Manual live recheck failed:', error);
       return i.editReply({ embeds: [errorEmbed('LIVE RECHECK FAILED', 'The live check could not be completed right now. Please try again in a moment.')] });
+    }
+  },
+
+  async streamcheck(i) {
+    await i.deferReply();
+    try {
+      if (typeof pollKickStreams === 'function') await pollKickStreams();
+      if (typeof pollYoutubeChannels === 'function') await pollYoutubeChannels();
+
+      const guild = i.guild;
+      const c = cfg(guild.id);
+      const kickLines = c.kick.length ? c.kick.map((k) => `${k.live ? '🟢' : '⚫'} ${k.slug} — ${k.live ? 'LIVE' : 'OFFLINE'}`).join('\n') : '⚫ No Kick channels tracked';
+      const youtubeLines = c.youtube.length ? c.youtube.map((y) => `${y.live ? '🔴' : '⚫'} ${y.name || y.id} — ${y.live ? 'LIVE' : 'OFFLINE'}`).join('\n') : '⚫ No YouTube channels tracked';
+
+      const e = infoEmbed('🔎 STREAM CHECK COMPLETE', `Last checked: <t:${Math.floor(Date.now() / 1000)}:F>`, [
+        { name: 'Kick', value: kickLines, inline: false },
+        { name: 'YouTube', value: youtubeLines, inline: false },
+      ]);
+      return i.editReply({ embeds: [e] });
+    } catch (error) {
+      console.error('Stream check failed:', error);
+      return i.editReply({ embeds: [errorEmbed('STREAM CHECK FAILED', 'The stream status check could not be completed right now. Please try again in a moment.')] });
     }
   },
 
@@ -500,7 +525,45 @@ const H = {
 };
 
 client.on('interactionCreate', async (i) => {
+  if (i.isButton()) {
+    if (i.customId.startsWith('kick_status_')) {
+      const slug = i.customId.replace('kick_status_', '').trim();
+      const tracked = cfg(i.guild.id).kick.find((k) => k.slug === slug);
+      if (!tracked) return i.reply({ embeds: [infoEmbed('🔎 KICK STATUS', `${slug} is not being tracked here.`)], flags: MessageFlags.Ephemeral }).catch(() => {});
+      try {
+        const data = await fetchKick(slug);
+        const live = Boolean(data?.live);
+        const status = infoEmbed('🔎 KICK STATUS', `${live ? '🟢' : '⚫'} **${slug}** is currently ${live ? 'LIVE' : 'OFFLINE'}.`, [{ name: 'Last checked', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: false }]);
+        return i.reply({ embeds: [status], flags: MessageFlags.Ephemeral }).catch(() => {});
+      } catch (error) {
+        console.error('Kick status button failed:', error);
+        return i.reply({ embeds: [errorEmbed('KICK STATUS ERROR', 'The status check could not be completed right now.')], flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+
+    if (i.customId.startsWith('youtube_status_')) {
+      const videoId = i.customId.replace('youtube_status_', '').trim();
+      try {
+        const guild = i.guild;
+        const c = cfg(guild.id);
+        const y = c.youtube.find((item) => item.id === videoId || item.seen?.includes(videoId));
+        const status = infoEmbed('🔎 YOUTUBE STATUS', y ? '🟢 The channel is currently live or recently active.' : '⚫ No matching tracked YouTube channel was found for this status check.', [{ name: 'Last checked', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: false }]);
+        return i.reply({ embeds: [status], flags: MessageFlags.Ephemeral }).catch(() => {});
+      } catch (error) {
+        console.error('YouTube status button failed:', error);
+        return i.reply({ embeds: [errorEmbed('YOUTUBE STATUS ERROR', 'The status check could not be completed right now.')], flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+
+    return;
+  }
+
   if (!i.isChatInputCommand() || !i.inGuild()) return;
+  if (i.commandName === 'streamcheck' && !isAdmin(i.member)) {
+    const permissionText = 'You need:\n**Administrator**\n\nto use this command.';
+    const p = { embeds: [errorEmbed('PERMISSION REQUIRED', permissionText)], flags: MessageFlags.Ephemeral };
+    return (i.deferred || i.replied) ? i.followUp(p).catch(() => {}) : i.reply(p).catch(() => {});
+  }
   if (!isMod(i.member)) {
     const permissionText = 'You need:\n**Moderate Members**\n\nto use this command.';
     const p = { embeds: [errorEmbed('PERMISSION REQUIRED', permissionText)], flags: MessageFlags.Ephemeral };
@@ -634,15 +697,48 @@ async function fetchYouTubeDetails(ids) {
 
 async function announceYouTubeLive(guild, announceCfg, feed, video, thumb) {
   if (!announceCfg) return false;
-  const url = `https://youtu.be/${video.id}`;
-  const e = new EmbedBuilder().setColor(COLORS.yt).setTitle(video.title).setURL(url)
-    .setAuthor({ name: `${feed.author} is LIVE on YouTube` })
-    .setImage(thumb ?? `https://i.ytimg.com/vi/${video.id}/maxresdefault.jpg`).setTimestamp().setFooter({ text: FOOTER_TEXT });
+  const url = `https://youtube.com/watch?v=${video.id}`;
+  const e = buildYoutubeLiveEmbed(feed, video, thumb);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('🔴 Watch on YouTube').setStyle(ButtonStyle.Link).setURL(url),
+    new ButtonBuilder().setCustomId(`youtube_status_${video.id}`).setLabel('🔄 Check Status').setStyle(ButtonStyle.Secondary),
+  );
   const text = `🔴 **${feed.author}** is live now!`;
-  await sendTo(guild, announceCfg.channel, { content: `${announceCfg.role ? `<@&${announceCfg.role}> ` : ''}${text}\n${url}`, embeds: [e], allowedMentions: { roles: announceCfg.role ? [announceCfg.role] : [] } });
+  await sendTo(guild, announceCfg.channel, { content: `${announceCfg.role ? `<@&${announceCfg.role}> ` : ''}${text}\n${url}`, embeds: [e], components: [row], allowedMentions: { roles: announceCfg.role ? [announceCfg.role] : [] } });
   log(guild, 'youtube', embed('YouTube LIVE announcement sent', `**${feed.author}**: [${video.title}](${url})`, COLORS.yt));
   return true;
 }
+
+const resolveYoutubeChannel = resolveYouTubeId;
+const fetchVideosInfo = fetchYouTubeDetails;
+const getLatestUploadVideoId = async (channelId) => {
+  const feed = await fetchYouTubeFeed(channelId);
+  return feed?.videos?.[0]?.id ?? null;
+};
+
+const buildYoutubeLiveEmbed = function buildYouTubeLiveEmbed(feed, video, thumb) {
+  const url = `https://youtube.com/watch?v=${video.id}`;
+  return new EmbedBuilder()
+    .setColor(COLORS.yt)
+    .setTitle(video.title || `${feed.author} is live`)
+    .setURL(url)
+    .setAuthor({ name: `${feed.author} is LIVE on YouTube` })
+    .setImage(thumb ?? `https://i.ytimg.com/vi/${video.id}/maxresdefault.jpg`)
+    .setTimestamp()
+    .setFooter({ text: FOOTER_TEXT });
+};
+
+const buildYoutubeUploadEmbed = function buildYouTubeUploadEmbed(feed, video, thumb, isShort = false) {
+  const url = `https://youtube.com/watch?v=${video.id}`;
+  return new EmbedBuilder()
+    .setColor(isShort ? 0xff8c00 : COLORS.yt)
+    .setTitle(video.title || `${feed.author} posted a new video`)
+    .setURL(url)
+    .setAuthor({ name: isShort ? `${feed.author} posted a new Short` : `${feed.author} just uploaded a video` })
+    .setImage(thumb ?? `https://i.ytimg.com/vi/${video.id}/maxresdefault.jpg`)
+    .setTimestamp()
+    .setFooter({ text: FOOTER_TEXT });
+};
 
 async function checkYouTubeChannel(guild, y, options = {}) {
   if (!YT_ENABLED) return { sent: false, live: false, value: null };
@@ -662,6 +758,7 @@ async function checkYouTubeChannel(guild, y, options = {}) {
   }
 
   const toSend = [];
+  let currentLive = false;
   for (const v of unseen) {
     const sn = details?.[v.id];
     if (details && !sn) { y.seen.push(v.id); continue; }
@@ -669,11 +766,20 @@ async function checkYouTubeChannel(guild, y, options = {}) {
     if (state === 'upcoming') continue;
     y.seen.push(v.id);
     const done = { v, live: state === 'live', thumb: sn?.thumbnails?.maxres?.url ?? sn?.thumbnails?.high?.url };
+    if (done.live) currentLive = true;
     if (done.live || !announceOnlyLive) toSend.push(done);
   }
 
+  if (feed.videos?.length && details) {
+    for (const v of feed.videos.slice(0, 8)) {
+      const sn = details[v.id];
+      if (sn?.liveBroadcastContent === 'live') { currentLive = true; break; }
+    }
+  }
+
+  y.live = currentLive;
   y.seen = y.seen.slice(-60); save();
-  if (!a) return { sent: false, live: false };
+  if (!a) return { sent: false, live: currentLive, value: currentLive ? y.name || y.id : null };
 
   let sentCount = 0;
   let liveName = null;
@@ -687,18 +793,16 @@ async function checkYouTubeChannel(guild, y, options = {}) {
       continue;
     }
     if (announceOnlyLive) continue;
-    const url = `https://youtu.be/${v.id}`;
-    const e = new EmbedBuilder().setColor(COLORS.yt).setTitle(v.title).setURL(url)
-      .setAuthor({ name: `${feed.author} just posted on YouTube` })
-      .setImage(thumb ?? `https://i.ytimg.com/vi/${v.id}/maxresdefault.jpg`).setTimestamp().setFooter({ text: FOOTER_TEXT });
+    const url = `https://youtube.com/watch?v=${v.id}`;
+    const e = buildYoutubeUploadEmbed(feed, v, thumb, false);
     await sendTo(guild, a.channel, { content: `${a.role ? `<@&${a.role}> ` : ''}📺 **${feed.author}** has a new video!\n${url}`, embeds: [e], allowedMentions: { roles: a.role ? [a.role] : [] } });
     log(guild, 'youtube', embed('YouTube announcement sent', `**${feed.author}**: [${v.title}](${url})`, COLORS.yt));
   }
 
-  return { sent: sentCount > 0, live: sentCount > 0, value: liveName };
+  return { sent: sentCount > 0, live: currentLive || sentCount > 0, value: liveName || (currentLive ? y.name || y.id : null) };
 }
 
-async function pollYouTube() {
+const pollYoutubeChannels = async function pollYouTube() {
   for (const guild of client.guilds.cache.values()) {
     const c = cfg(guild.id);
     if (!c.youtube.length) continue;
@@ -706,7 +810,8 @@ async function pollYouTube() {
       await checkYouTubeChannel(guild, y);
     }
   }
-}
+};
+const youtubeAnnouncements = { poll: pollYoutubeChannels, check: checkYouTubeChannel, announce: announceYouTubeLive };
 
 // ───────────────────────── Kick ─────────────────────────
 // Official Kick API (needs KICK_CLIENT_ID + KICK_CLIENT_SECRET). Falls back to the
@@ -753,15 +858,31 @@ async function fetchKick(slug, retry = true) {
   } catch (e) { console.error('Kick fetch failed', e.message); return null; }
 }
 
-async function announceKickLive(guild, announceCfg, data) {
-  if (!announceCfg) return false;
-  const e = new EmbedBuilder().setColor(COLORS.kick).setTitle(data.title || `${data.name} is live!`).setURL(`https://kick.com/${data.name}`)
+const buildKickLiveEmbed = function buildKickEmbed(data) {
+  const url = `https://kick.com/${data.name}`;
+  const e = new EmbedBuilder()
+    .setColor(COLORS.kick)
+    .setTitle(data.title || `${data.name} is live!`)
+    .setURL(url)
     .setAuthor({ name: `${data.name} is live on Kick` })
-    .addFields({ name: 'Category', value: data.category ?? 'Unknown', inline: true })
-    .setTimestamp().setFooter({ text: FOOTER_TEXT });
+    .setTimestamp()
+    .setFooter({ text: FOOTER_TEXT });
+
+  if (data.category) e.addFields({ name: 'Category', value: data.category, inline: true });
   if (data.viewers != null) e.addFields({ name: 'Viewers', value: String(data.viewers), inline: true });
   if (data.thumbnail) e.setImage(data.thumbnail);
-  await sendTo(guild, announceCfg.channel, { content: `${announceCfg.role ? `<@&${announceCfg.role}> ` : ''}🟢 **${data.name}** is live!\nhttps://kick.com/${data.name}`, embeds: [e], allowedMentions: { roles: announceCfg.role ? [announceCfg.role] : [] } });
+  return e;
+};
+
+async function announceKickLive(guild, announceCfg, data) {
+  if (!announceCfg) return false;
+  const url = `https://kick.com/${data.name}`;
+  const e = buildKickLiveEmbed(data);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('🔴 Watch on Kick').setStyle(ButtonStyle.Link).setURL('https://kick.com/'),
+    new ButtonBuilder().setCustomId(`kick_status_${data.name}`).setLabel('🔄 Check Status').setStyle(ButtonStyle.Secondary),
+  );
+  await sendTo(guild, announceCfg.channel, { content: `${announceCfg.role ? `<@&${announceCfg.role}> ` : ''}🟢 **${data.name}** is live!\n${url}`, embeds: [e], components: [row], allowedMentions: { roles: announceCfg.role ? [announceCfg.role] : [] } });
   log(guild, 'kick', embed('Kick announcement sent', `**${data.name}** went live.`, COLORS.kick));
   return true;
 }
@@ -783,7 +904,7 @@ async function checkKickChannel(guild, k, options = {}) {
   return { sent: false, live: !!d.live, value: d.live ? d.name : null };
 }
 
-async function pollKick() {
+const pollKickStreams = async function pollKick() {
   for (const guild of client.guilds.cache.values()) {
     const c = cfg(guild.id);
     if (!c.kick.length) continue;
@@ -791,7 +912,11 @@ async function pollKick() {
       await checkKickChannel(guild, k);
     }
   }
-}
+};
+
+const getKickAppToken = getKickToken;
+const fetchKickChannel = fetchKick;
+const kickAnnouncements = { poll: pollKickStreams, check: checkKickChannel, announce: announceKickLive };
 
 // ───────────────────────── Boot ─────────────────────────
 client.once('ready', async () => {
@@ -806,8 +931,8 @@ client.once('ready', async () => {
     await rest.put(route, { body: commands });
     console.log(`Registered ${commands.length} commands`);
   } catch (e) { console.error('Command registration failed', e); }
-  setInterval(() => pollYouTube().catch(console.error), POLL_MS);
-  setInterval(() => pollKick().catch(console.error), POLL_MS);
+  setInterval(() => pollYoutubeChannels().catch(console.error), YOUTUBE_POLL_INTERVAL_MS);
+  setInterval(() => pollKickStreams().catch(console.error), KICK_POLL_INTERVAL_MS);
 });
 
 process.on('unhandledRejection', (e) => console.error('Unhandled', e));
