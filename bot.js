@@ -34,6 +34,12 @@ const {
 
 const CHECK_INTERVAL = 30 * 1000;
 
+const COMMAND_ENABLEMENTS = {
+  recheck: process.env.ENABLE_RECHECK !== "false",
+  kick: process.env.ENABLE_KICK_COMMAND !== "false",
+  youtube: process.env.ENABLE_YOUTUBE_COMMAND !== "false"
+};
+
 function normalizeMentionRoleId(value) {
   if (!value) return null;
   const cleaned = String(value).trim();
@@ -450,15 +456,15 @@ async function recheck() {
 // ===============================
 
 const commands = [
-  new SlashCommandBuilder()
+  COMMAND_ENABLEMENTS.recheck ? new SlashCommandBuilder()
     .setName("recheck")
     .setDescription(
       "Immediately check Kick and YouTube live status"
     )
     .setDefaultMemberPermissions(
       PermissionsBitField.Flags.Administrator.toString()
-    )
-].map(command =>
+    ) : null,
+].filter(Boolean).map(command =>
   command.toJSON()
 );
 
@@ -550,6 +556,13 @@ client.on(
       "recheck"
     ) {
       return;
+    }
+
+    if (!COMMAND_ENABLEMENTS.recheck) {
+      return interaction.reply({
+        content: "❌ This command is disabled.",
+        ephemeral: true
+      });
     }
 
     if (
