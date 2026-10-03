@@ -566,28 +566,22 @@ client.once(Events.ClientReady, async c => {
   start(c);
 });
 
-// ── "I'm busy" auto-reply: when anyone @mentions this user, the bot answers for them ──
-const BUSY_USER_ID = process.env.BUSY_USER_ID || '1247224586911617105';
-const BUSY_MESSAGE = process.env.BUSY_MESSAGE || "I'm currently busy, talk to you later. 🙏";
-const BUSY_COOLDOWN_MS = 10_000; // max one auto-reply per channel every 10s, so a spam of mentions can't flood the chat
-const busyLast = new Map();
-client.on(Events.MessageCreate, async message => {
-  try {
-    if (message.author.bot || !message.guild) return;
-    if (message.author.id === BUSY_USER_ID) return;                // they can mention themselves in peace
-    if (!message.mentions.users.has(BUSY_USER_ID)) return;         // only direct @user mentions (not @everyone / roles)
-    const last = busyLast.get(message.channelId) || 0;
-    if (Date.now() - last < BUSY_COOLDOWN_MS) return;
-    busyLast.set(message.channelId, Date.now());
-    const payload = { content: BUSY_MESSAGE, allowedMentions: { parse: [], repliedUser: false } };
-    await message.reply(payload).catch(() => message.channel.send({ content: BUSY_MESSAGE, allowedMentions: { parse: [] } }));
-  } catch (err) { console.error('Busy auto-reply error:', err.message); }
-});
-
 client.on(Events.InteractionCreate, i => { handle(i).catch(err => console.error('Interaction error:', err)); });
 client.on(Events.GuildCreate, g => g.commands.set(commands).catch(console.error));
 client.on(Events.GuildDelete, g => forgetGuild(g.id));
 client.on('error', err => console.error('Discord client error:', err));
+
+// ── connection diagnostics + watchdog (restarts the process if the Discord link stays dead) ──
+client.on(Events.ShardDisconnect, (e, id) => console.warn(`⚠️ Shard ${id} disconnected (code ${e?.code})`));
+client.on(Events.ShardReconnecting, id => console.warn(`🔄 Shard ${id} reconnecting…`));
+client.on(Events.ShardResume, id => console.log(`✅ Shard ${id} resumed`));
+client.on(Events.ShardError, (err, id) => console.error(`❌ Shard ${id} error:`, err.message));
+let deadChecks = 0;
+setInterval(() => {
+  const ok = client.isReady() && client.ws.status === 0 && client.ws.ping >= 0;
+  deadChecks = ok ? 0 : deadChecks + 1;
+  if (deadChecks >= 3) { console.error('❌ Discord connection dead for ~3 min — exiting so Render restarts the bot'); process.exit(1); }
+}, 60_000).unref();
 
 console.log('🚀 Starting PURNIMA…');
 client.login(TOKEN).catch(err => { console.error('❌ Discord login failed:', err.message); process.exit(1); });
