@@ -1,50 +1,52 @@
-// Live Announcer — YouTube + Kick → Discord
-// Node 18+  |  npm i discord.js
+// streams.js — Kick + YouTube live announcements (drop-in module for the PURNIMA bot)
+// Needs: Node 18+, discord.js v14.  Env: KICK_CLIENT_ID, KICK_CLIENT_SECRET, YOUTUBE_API_KEY
+// Optional env: DATA_DIR (put it on a Render Disk, e.g. /data, so the streamer list survives deploys)
 //
-// ENV (rename below if yours differ):
-//   DISCORD_TOKEN, KICK_CLIENT_ID, KICK_CLIENT_SECRET, YOUTUBE_API_KEY
-//   DATA_DIR (optional, point to a Render Disk mount, e.g. /data)
-//
-// Commands:
-//   /kickadd user channel ping      /youtubeadd user channel ping
-//   /kick remove user               /youtube remove user
-//   /kick disable user              /youtube disable user
-//   /kick recheck [user]            /youtube recheck [user]
+// Commands (all need Administrator or Manage Server):
+//   /kickadd user channel [ping]      /youtubeadd user channel [ping]
+//   /kickremove user                  /youtuberemove user
+//   /kickdisable user                 /youtubedisable user
+//   /kickrecheck [user] [force]       /youtuberecheck [user] [force]
+//   /kicklist                         /youtubelist
 
 const fs = require('fs');
 const path = require('path');
 const {
-  Client, Events, GatewayIntentBits, SlashCommandBuilder, ChannelType, EmbedBuilder,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, MessageFlags,
+  SlashCommandBuilder, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder,
+  ButtonStyle, PermissionFlagsBits,
 } = require('discord.js');
 
-const {
-  DISCORD_TOKEN, KICK_CLIENT_ID, KICK_CLIENT_SECRET, YOUTUBE_API_KEY,
-  DATA_DIR = __dirname,
-} = process.env;
-
+const BRAND = 'PURNIMA';
 const POLL_MS = 30_000;
-const OFFLINE_STRIKES_TO_RESET = 2; // avoids re-announcing on short stream drops
-const DB_FILE = path.join(DATA_DIR, 'streamers.json');
-const COLORS = { kick: 0x53fc18, youtube: 0xff0000, ok: 0x2ecc71, off: 0x95a5a6, err: 0xe74c3c, info: 0x5865f2 };
+const OFFLINE_STRIKES_TO_RESET = 2; // must be offline 2 checks in a row before a new stream counts as "new"
+const COLORS = { kick: 0x53fc18, youtube: 0xff0000, ok: 0x2ecc71, off: 0x95a5a6, err: 0xe74c3c, info: 0x3498db };
 const NAMES = { kick: 'Kick', youtube: 'YouTube' };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const env = k => process.env[k];
 
-/* ───────────── storage (tiny JSON db) ───────────── */
+let client = null;
+
+/* ───────────── storage (JSON file, survives restarts) ───────────── */
+const DB_FILE = path.join(env('DATA_DIR') || __dirname, 'streamers.json');
 let db = [];
 try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { db = []; }
-const save = () => {
-  const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-  fs.renameSync(tmp, DB_FILE);
-};
+function save() {
+  try {
+    fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+    const tmp = DB_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+    fs.renameSync(tmp, DB_FILE);
+  } catch (e) { console.error('streams: could not save', e.message); }
+}
 const find = (guildId, platform, username) =>
   db.find(e => e.guildId === guildId && e.platform === platform && e.username === username);
 
 /* ───────────── helpers ───────────── */
-const clean = s => s.trim().replace(/^@+/, '').toLowerCase(); // strips any leading @ → no "@@"
+const norm = s => String(s || '').toLowerCase().replace(/[\s@]/g, '');
+const trunc = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s || '');
+const kickSlug = s => s.trim().replace(/^https?:\/\/(www\.)?kick\.com\//i, '').split(/[/?#]/)[0].replace(/^@+/, '').toLowerCase();
 
-// Build the ping from IDs only (never from user text) → can't produce double @@
+// Ping is built from role IDs only (never typed text) → can never produce "@@"
 function pingText(roleId, guildId) {
   if (!roleId) return '';
   return roleId === guildId ? '@everyone' : `<@&${roleId}>`;
@@ -53,26 +55,26 @@ function allowedMentions(roleId, guildId) {
   if (!roleId) return { parse: [] };
   return roleId === guildId ? { parse: ['everyone'] } : { parse: [], roles: [roleId] };
 }
-const trunc = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s || '');
 
 /* ───────────── Kick ───────────── */
 let kickToken = { value: null, exp: 0 };
 async function getKickToken() {
   if (kickToken.value && Date.now() < kickToken.exp) return kickToken.value;
+  if (!env('KICK_CLIENT_ID') || !env('KICK_CLIENT_SECRET')) throw new Error('KICK_CLIENT_ID / KICK_CLIENT_SECRET not set');
   const res = await fetch('https://id.kick.com/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type: 'client_credentials', client_id: KICK_CLIENT_ID, client_secret: KICK_CLIENT_SECRET,
+      grant_type: 'client_credentials', client_id: env('KICK_CLIENT_ID'), client_secret: env('KICK_CLIENT_SECRET'),
     }),
   });
-  if (!res.ok) throw new Error(`Kick token ${res.status}`);
+  if (!res.ok) throw new Error(`Kick token request failed (${res.status})`);
   const j = await res.json();
-  kickToken = { value: j.access_token, exp: Date.now() + (j.expires_in - 120) * 1000 };
+  kickToken = { value: j.access_token, exp: Date.now() + ((j.expires_in || 3600) - 120) * 1000 };
   return kickToken.value;
 }
 // returns Map(slug → channel data)
-async function kickFetch(slugs) {
+async function kickFetch(slugs, retry = true) {
   const out = new Map();
   const token = await getKickToken();
   for (let i = 0; i < slugs.length; i += 50) {
@@ -81,51 +83,63 @@ async function kickFetch(slugs) {
     const res = await fetch(`https://api.kick.com/public/v1/channels?${qs}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (res.status === 401) { kickToken.value = null; throw new Error('Kick 401'); }
-    if (!res.ok) throw new Error(`Kick ${res.status}`);
-    for (const c of (await res.json()).data || []) out.set(c.slug.toLowerCase(), c);
+    if (res.status === 401 && retry) { kickToken.value = null; return kickFetch(slugs, false); }
+    if (!res.ok) throw new Error(`Kick API ${res.status}`);
+    for (const c of (await res.json()).data || []) out.set(String(c.slug).toLowerCase(), c);
   }
   return out;
 }
 
 /* ───────────── YouTube ───────────── */
-async function yt(endpoint, params) {
-  const qs = new URLSearchParams({ ...params, key: YOUTUBE_API_KEY });
+async function ytApi(endpoint, params) {
+  if (!env('YOUTUBE_API_KEY')) throw new Error('YOUTUBE_API_KEY not set');
+  const qs = new URLSearchParams({ ...params, key: env('YOUTUBE_API_KEY') });
   const res = await fetch(`https://www.googleapis.com/youtube/v3/${endpoint}?${qs}`);
-  if (!res.ok) throw new Error(`YouTube ${endpoint} ${res.status}`);
+  if (!res.ok) {
+    let msg = '';
+    try { msg = (await res.json()).error?.message || ''; } catch { /* ignore */ }
+    throw new Error(`YouTube ${endpoint} ${res.status} ${msg}`.trim());
+  }
   return res.json();
 }
-// accepts @handle, handle, channel URL, or UC… id
+// accepts @handle, handle, channel URL (…/@name or …/channel/UC…), or a UC… channel ID
 async function resolveYouTube(input) {
   const raw = input.trim();
-  const idMatch = raw.match(/UC[\w-]{22}/);
-  let params;
-  if (idMatch) params = { id: idMatch[0] };
+  const id = raw.match(/UC[\w-]{22}/)?.[0];
+  let params; let handle = null;
+  if (id) params = { id };
   else {
-    const h = raw.match(/@([\w.\-]+)/)?.[1] || raw.replace(/^@+/, '');
-    params = { forHandle: '@' + h };
+    const h = raw.match(/@([\w.\-]+)/)?.[1] || raw.replace(/^@+/, '').split(/[/?#]/)[0];
+    handle = '@' + h;
+    params = { forHandle: handle };
   }
-  const j = await yt('channels', { part: 'snippet', ...params });
+  const j = await ytApi('channels', { part: 'snippet', ...params });
   const c = j.items?.[0];
   if (!c) return null;
-  return { channelId: c.id, display: c.snippet.title, avatar: c.snippet.thumbnails?.default?.url };
+  return { channelId: c.id, display: c.snippet.title, avatar: c.snippet.thumbnails?.default?.url, handle };
 }
-// Cheap & quota-friendly: free RSS feed finds recent uploads/streams,
-// then ONE batched videos.list (1 unit) checks which are live.
+// Recent video IDs for a channel. Free RSS feed first (no quota); falls back to the uploads playlist (1 unit).
+async function recentVideoIds(cid) {
+  try {
+    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${cid}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (res.ok) {
+      const ids = [...(await res.text()).matchAll(/<yt:videoId>([^<]+)<\/yt:videoId>/g)].map(m => m[1]).slice(0, 5);
+      if (ids.length) return ids;
+    }
+  } catch { /* fall through to API */ }
+  try {
+    const j = await ytApi('playlistItems', { part: 'contentDetails', playlistId: 'UU' + cid.slice(2), maxResults: '5' });
+    return (j.items || []).map(i => i.contentDetails.videoId);
+  } catch (e) { console.error('streams: YouTube fallback failed:', e.message); return []; }
+}
+// ONE batched videos.list call (1 quota unit) tells us which of those videos are live right now.
 async function ytFetchLive(channelIds) {
-  const candidates = new Map(); // videoId → channelId
-  await Promise.all(channelIds.map(async cid => {
-    try {
-      const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${cid}`);
-      if (!res.ok) return;
-      const ids = [...(await res.text()).matchAll(/<yt:videoId>([^<]+)<\/yt:videoId>/g)].slice(0, 5);
-      ids.forEach(m => candidates.set(m[1], cid));
-    } catch { /* skip this channel this round */ }
-  }));
-  const live = new Map(); // channelId → video
-  const vids = [...candidates.keys()];
-  for (let i = 0; i < vids.length; i += 50) {
-    const j = await yt('videos', { part: 'snippet,liveStreamingDetails', id: vids.slice(i, i + 50).join(',') });
+  const vids = new Set();
+  await Promise.all(channelIds.map(async cid => (await recentVideoIds(cid)).forEach(v => vids.add(v))));
+  const live = new Map(); // ytChannelId → video
+  const all = [...vids];
+  for (let i = 0; i < all.length; i += 50) {
+    const j = await ytApi('videos', { part: 'snippet,liveStreamingDetails', id: all.slice(i, i + 50).join(',') });
     for (const v of j.items || []) {
       if (v.snippet.liveBroadcastContent === 'live') live.set(v.snippet.channelId, v);
     }
@@ -134,11 +148,9 @@ async function ytFetchLive(channelIds) {
 }
 
 /* ───────────── announcement ───────────── */
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
 async function announce(entry, info) {
-  const channel = await client.channels.fetch(entry.channelId).catch(() => null);
-  if (!channel?.isTextBased()) throw new Error(`Channel missing for ${entry.username}`);
+  const channel = await client.channels.fetch(entry.discordChannelId).catch(() => null);
+  if (!channel || !channel.isTextBased()) throw new Error('announcement channel not found (deleted or no access)');
 
   const p = NAMES[entry.platform];
   const embed = new EmbedBuilder()
@@ -147,28 +159,30 @@ async function announce(entry, info) {
     .setTitle(trunc(info.title || 'Untitled stream', 256))
     .setURL(info.url)
     .setDescription(`🔴 **${info.name}** just went live — come hang out!`)
-    .setTimestamp();
-  if (info.category) embed.addFields({ name: '🎮 Category', value: trunc(info.category, 100), inline: true });
-  embed.addFields({ name: '📺 Platform', value: p, inline: true });
+    .setTimestamp()
+    .setFooter({ text: `${BRAND} • ${p} Live Alerts` });
+  const fields = [];
+  if (info.category) fields.push({ name: '🎮 Category', value: trunc(info.category, 100), inline: true });
+  if (info.viewers != null) fields.push({ name: '👀 Viewers', value: String(info.viewers), inline: true });
+  fields.push({ name: '📺 Platform', value: p, inline: true });
+  embed.addFields(fields);
   if (info.image) embed.setImage(info.image);
-  embed.setFooter({ text: `${p} Live Alerts` });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('Watch now').setEmoji('▶️').setStyle(ButtonStyle.Link).setURL(info.url),
   );
-
   const ping = pingText(entry.pingRoleId, entry.guildId);
   await channel.send({
-    content: `${ping ? ping + ' ' : ''}🚨 **${info.name}** is live on **${p}**!`.trim(),
+    content: `${ping ? ping + ' ' : ''}🚨 **${info.name}** is live on **${p}**!`,
     embeds: [embed],
     components: [row],
     allowedMentions: allowedMentions(entry.pingRoleId, entry.guildId),
   });
 }
 
-/* ───────────── checking (shared by the 30s poll AND /recheck) ───────────── */
-// Announce ONLY on offline → live with a new stream key (or when force=true).
-// Returns { announced, error }. If sending fails, state is rolled back so the next check retries.
+/* ───────────── checking (shared by the 30s poll AND recheck) ───────────── */
+// Announces ONLY on offline → live with a NEW stream key (or when force=true).
+// If sending fails the state is rolled back, so the next check retries instead of silently skipping.
 async function handleState(entry, isLive, streamKey, buildInfo, force = false) {
   if (isLive) {
     entry.offlineStrikes = 0;
@@ -182,8 +196,8 @@ async function handleState(entry, isLive, streamKey, buildInfo, force = false) {
         await announce(entry, buildInfo());
         return { announced: true };
       } catch (e) {
-        console.error('Announce failed:', e.message);
-        entry.live = prev.live; // roll back so it retries instead of being marked "announced"
+        console.error(`streams: announce failed for ${entry.display}:`, e.message);
+        entry.live = prev.live;
         entry.lastKey = prev.lastKey;
         save();
         return { announced: false, error: e.message };
@@ -192,12 +206,16 @@ async function handleState(entry, isLive, streamKey, buildInfo, force = false) {
     if (!entry.live) { entry.live = true; save(); }
   } else if (entry.live) {
     entry.offlineStrikes = (entry.offlineStrikes || 0) + 1;
-    if (entry.offlineStrikes >= OFFLINE_STRIKES_TO_RESET) { entry.live = false; save(); }
+    if (entry.offlineStrikes >= OFFLINE_STRIKES_TO_RESET) {
+      entry.live = false;
+      if (String(entry.lastKey).startsWith('seen-')) entry.lastKey = null; // Kick sessions without a start_time
+      save();
+    }
   }
   return { announced: false };
 }
 
-// Checks the given entries once. Returns { results: [{entry, live, announced, error}], errors: [string] }
+// → { results: [{entry, live, announced, error}], errors: [string] }
 async function checkEntries(entries, force = false) {
   const results = [];
   const errors = [];
@@ -208,16 +226,19 @@ async function checkEntries(entries, force = false) {
       const data = await kickFetch([...new Set(kickEntries.map(e => e.username))]);
       for (const e of kickEntries) {
         const c = data.get(e.username);
-        if (!c) { errors.push(`Kick: ${e.display || e.username} not found`); continue; }
+        if (!c) { errors.push(`Kick: ${e.display} not found`); continue; }
         const s = c.stream;
-        const st = await handleState(e, !!s?.is_live, s?.start_time || String(Date.now()), () => ({
-          name: e.display || e.username,
+        const isLive = !!s?.is_live;
+        const key = isLive ? (s.start_time || (e.live && e.lastKey) || `seen-${Date.now()}`) : null;
+        const st = await handleState(e, isLive, key, () => ({
+          name: e.display,
           title: c.stream_title,
           category: c.category?.name,
+          viewers: s.viewer_count,
           image: s.thumbnail ? `${s.thumbnail}${s.thumbnail.includes('?') ? '&' : '?'}t=${Date.now()}` : null,
           url: `https://kick.com/${e.username}`,
         }), force);
-        results.push({ entry: e, live: !!s?.is_live, ...st });
+        results.push({ entry: e, live: isLive, ...st });
       }
     } catch (err) { errors.push(`Kick: ${err.message}`); }
   }
@@ -225,12 +246,13 @@ async function checkEntries(entries, force = false) {
   const ytEntries = entries.filter(e => e.platform === 'youtube');
   if (ytEntries.length) {
     try {
-      const live = await ytFetchLive([...new Set(ytEntries.map(e => e.channelId))]);
+      const live = await ytFetchLive([...new Set(ytEntries.map(e => e.ytChannelId))]);
       for (const e of ytEntries) {
-        const v = live.get(e.channelId);
-        const st = await handleState(e, !!v, v?.id, () => ({
-          name: e.display || e.username,
+        const v = live.get(e.ytChannelId);
+        const st = await handleState(e, !!v, v?.id || null, () => ({
+          name: e.display,
           title: v.snippet.title,
+          viewers: v.liveStreamingDetails?.concurrentViewers,
           avatar: e.avatar,
           image: `https://i.ytimg.com/vi/${v.id}/maxresdefault_live.jpg?t=${Date.now()}`,
           url: `https://www.youtube.com/watch?v=${v.id}`,
@@ -242,7 +264,7 @@ async function checkEntries(entries, force = false) {
   return { results, errors };
 }
 
-// One check at a time (poll + manual rechecks can never overlap → no duplicate sends)
+// One check at a time: the 30s poll and manual rechecks can never overlap → no duplicate sends
 let busy = false;
 async function runExclusive(entries, force = false) {
   while (busy) await sleep(300);
@@ -250,193 +272,202 @@ async function runExclusive(entries, force = false) {
   try { return await checkEntries(entries, force); } finally { busy = false; }
 }
 async function poll() {
-  if (busy) return; // previous run still going — skip this tick
-  const { errors } = await runExclusive(db.filter(e => e.enabled));
-  errors.forEach(e => console.error('Poll error:', e));
+  if (busy) return;
+  const active = db.filter(e => e.enabled);
+  if (!active.length) return;
+  const { errors } = await runExclusive(active);
+  errors.forEach(e => console.error('streams poll:', e));
 }
 
-/* ───────────── commands ───────────── */
+/* ───────────── slash commands ───────────── */
 const manage = PermissionFlagsBits.ManageGuild;
-const userOpt = (o, desc) => o.setName('user').setDescription(desc).setRequired(true);
+const LABEL = { kick: 'Kick', youtube: 'YouTube' };
+const HINT = { kick: 'Kick username or kick.com link', youtube: 'YouTube @handle, channel link or channel ID' };
 
-const addCmd = (name, platform, hint) =>
-  new SlashCommandBuilder().setName(name)
-    .setDescription(`Announce when a ${platform} streamer goes live`)
-    .setDefaultMemberPermissions(manage)
-    .addStringOption(o => userOpt(o, hint))
-    .addChannelOption(o => o.setName('channel').setDescription('Where to post the announcement')
-      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true))
-    .addRoleOption(o => o.setName('ping').setDescription('Role to ping (optional, @everyone allowed)'));
-
-const groupCmd = (name, platform) =>
-  new SlashCommandBuilder().setName(name)
-    .setDescription(`Manage ${platform} live alerts`)
-    .setDefaultMemberPermissions(manage)
-    .addSubcommand(s => s.setName('remove').setDescription('Stop tracking and delete a streamer')
-      .addStringOption(o => userOpt(o, 'Streamer name')))
-    .addSubcommand(s => s.setName('disable').setDescription('Pause alerts (re-run the add command to resume)')
-      .addStringOption(o => userOpt(o, 'Streamer name')))
-    .addSubcommand(s => s.setName('recheck').setDescription('Check right now if streamers are live')
+function buildCommands() {
+  const out = [];
+  for (const p of ['kick', 'youtube']) {
+    out.push(new SlashCommandBuilder().setName(`${p}add`)
+      .setDescription(`Announce when a ${LABEL[p]} streamer goes live`)
+      .setDefaultMemberPermissions(manage)
+      .addStringOption(o => o.setName('user').setDescription(HINT[p]).setRequired(true))
+      .addChannelOption(o => o.setName('channel').setDescription('Where to post the announcement')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true))
+      .addRoleOption(o => o.setName('ping').setDescription('Role to ping (optional, @everyone allowed)')));
+    out.push(new SlashCommandBuilder().setName(`${p}remove`)
+      .setDescription(`Stop tracking a ${LABEL[p]} streamer and delete them`)
+      .setDefaultMemberPermissions(manage)
+      .addStringOption(o => o.setName('user').setDescription('Streamer name').setRequired(true)));
+    out.push(new SlashCommandBuilder().setName(`${p}disable`)
+      .setDescription(`Pause alerts for a ${LABEL[p]} streamer (run /${p}add again to resume)`)
+      .setDefaultMemberPermissions(manage)
+      .addStringOption(o => o.setName('user').setDescription('Streamer name').setRequired(true)));
+    out.push(new SlashCommandBuilder().setName(`${p}recheck`)
+      .setDescription(`Check right now if ${LABEL[p]} streamers are live`)
+      .setDefaultMemberPermissions(manage)
       .addStringOption(o => o.setName('user').setDescription('Streamer name (leave empty to check everyone)'))
       .addBooleanOption(o => o.setName('force').setDescription('Re-send the announcement even if already announced')));
-
-const commands = [
-  addCmd('kickadd', 'Kick', 'Kick username'),
-  groupCmd('kick', 'Kick'),
-  addCmd('youtubeadd', 'YouTube', 'YouTube @handle, channel URL or ID'),
-  groupCmd('youtube', 'YouTube'),
-].map(c => c.toJSON());
-
-const reply = (i, color, text) =>
-  i.reply({ embeds: [new EmbedBuilder().setColor(color).setDescription(text)], flags: MessageFlags.Ephemeral });
-
-// turn typed input into the stored key for this platform
-async function resolveKey(guildId, platform, input) {
-  let key = clean(input);
-  if (platform === 'youtube' && !/^uc[\w-]{22}$/.test(key)) {
-    const norm = s => s.toLowerCase().replace(/\s/g, '');
-    const hit = db.find(e => e.guildId === guildId && e.platform === 'youtube'
-      && (norm(e.display) === norm(key)));
-    if (hit) return hit.username;
-    const r = await resolveYouTube(input).catch(() => null);
-    if (r) key = r.channelId.toLowerCase();
+    out.push(new SlashCommandBuilder().setName(`${p}list`)
+      .setDescription(`Show tracked ${LABEL[p]} streamers`)
+      .setDefaultMemberPermissions(manage));
   }
-  return key;
+  return out.map(c => c.toJSON());
+}
+const commands = buildCommands();
+
+function embed(color, title, text) {
+  return new EmbedBuilder().setColor(color).setTitle(title).setDescription(text)
+    .setTimestamp().setFooter({ text: `${BRAND} • Live Alerts` });
+}
+async function say(i, color, title, text, opts = {}) {
+  const payload = { embeds: [embed(color, title, text)] };
+  if (i.deferred || i.replied) return i.editReply(payload);
+  return i.reply({ ...payload, ephemeral: opts.ephemeral !== false });
 }
 
-client.on(Events.InteractionCreate, async i => {
-  if (!i.isChatInputCommand() || !i.guildId) return;
-  try {
-    const isAdd = i.commandName.endsWith('add');
-    const platform = i.commandName.startsWith('kick') ? 'kick' : 'youtube';
-    const p = NAMES[platform];
+async function findEntry(guildId, platform, input) {
+  const list = db.filter(e => e.guildId === guildId && e.platform === platform);
+  const n = norm(platform === 'kick' ? kickSlug(input) : input);
+  const hit = list.find(e => norm(e.display) === n || norm(e.username) === n || (e.handle && norm(e.handle) === n));
+  if (hit) return hit;
+  if (platform === 'youtube') {
+    const r = await resolveYouTube(input).catch(() => null);
+    if (r) return list.find(e => e.username === r.channelId.toLowerCase()) || null;
+  }
+  return null;
+}
 
-    /* ── /kickadd | /youtubeadd ── */
-    if (isAdd) {
-      await i.deferReply({ flags: MessageFlags.Ephemeral });
+function statusLine(r) {
+  const name = `**${r.entry.display}**`;
+  if (!r.live) return `⚫ ${name} — offline`;
+  if (r.error) return `⚠️ ${name} — live, but the announcement FAILED: ${r.error}\n   ↳ Give the bot View Channel, Send Messages and Embed Links in <#${r.entry.discordChannelId}>`;
+  return r.announced ? `🔴 ${name} — live · announcement sent` : `🔴 ${name} — live · already announced`;
+}
+
+// Returns true if the interaction was one of ours (so the main bot can stop processing it).
+async function handle(i) {
+  if (!i.isChatInputCommand()) return false;
+  const m = i.commandName.match(/^(kick|youtube)(add|remove|disable|recheck|list)$/);
+  if (!m) return false;
+  const [, platform, action] = m;
+  const p = NAMES[platform];
+
+  try {
+    if (!i.inGuild()) { await say(i, COLORS.err, '❌ Server only', 'Use this command inside a server.'); return true; }
+    const perms = i.memberPermissions;
+    if (!perms?.has(PermissionFlagsBits.Administrator) && !perms?.has(PermissionFlagsBits.ManageGuild)) {
+      await say(i, COLORS.err, '❌ Permission denied', 'You need **Administrator** or **Manage Server**.');
+      return true;
+    }
+
+    /* add */
+    if (action === 'add') {
+      await i.deferReply();
       const input = i.options.getString('user', true);
       const channel = i.options.getChannel('channel', true);
       const role = i.options.getRole('ping');
-      const done = (color, text) => i.editReply({ embeds: [new EmbedBuilder().setColor(color).setDescription(text)] });
-
-      let entry = { platform, guildId: i.guildId, channelId: channel.id, pingRoleId: role?.id || null,
-        enabled: true, live: false, lastKey: null, offlineStrikes: 0 };
+      const base = { platform, guildId: i.guildId, discordChannelId: channel.id, pingRoleId: role?.id || null, enabled: true };
+      let fields;
 
       if (platform === 'kick') {
-        const slug = clean(input);
-        const data = await kickFetch([slug]);
-        const c = data.get(slug);
-        if (!c) return done(COLORS.err, `❌ Couldn't find **${slug}** on Kick.`);
-        Object.assign(entry, { username: slug, display: c.slug });
-        if (c.stream?.is_live) Object.assign(entry, { live: true, lastKey: c.stream.start_time });
+        const slug = kickSlug(input);
+        if (!slug) return await say(i, COLORS.err, '❌ No username', 'Please enter a Kick username.'), true;
+        const c = (await kickFetch([slug])).get(slug);
+        if (!c) return await say(i, COLORS.err, '❌ Not found', `Couldn't find **${slug}** on Kick. Use the name from kick.com/**name**.`), true;
+        fields = { username: slug, display: String(c.slug) };
       } else {
         const r = await resolveYouTube(input);
-        if (!r) return done(COLORS.err, `❌ Couldn't find that YouTube channel. Try the @handle or channel ID.`);
-        Object.assign(entry, { username: r.channelId.toLowerCase(), channelId: r.channelId, display: r.display, avatar: r.avatar });
-        const live = await ytFetchLive([r.channelId]);
-        if (live.has(r.channelId)) Object.assign(entry, { live: true, lastKey: live.get(r.channelId).id });
+        if (!r) return await say(i, COLORS.err, '❌ Not found', "Couldn't find that YouTube channel. Use the **@handle**, channel link or channel ID (UC…)."), true;
+        fields = { username: r.channelId.toLowerCase(), ytChannelId: r.channelId, display: r.display, avatar: r.avatar, handle: r.handle };
       }
-      // Already-live streams are recorded silently so adding someone never triggers an old-stream announcement.
-      const existing = find(i.guildId, platform, entry.username);
-      if (existing) Object.assign(existing, entry); else db.push(entry);
+
+      let entry = find(i.guildId, platform, fields.username);
+      if (entry) Object.assign(entry, base, fields);                          // re-adding keeps the live/announced state → no repeat
+      else { entry = { ...base, ...fields, live: false, lastKey: null, offlineStrikes: 0 }; db.push(entry); }
       save();
 
+      // check right away: if they're live right now, the announcement goes out now
+      const { results, errors } = await runExclusive([entry]);
+      const r0 = results[0];
       const ping = pingText(entry.pingRoleId, i.guildId) || 'no ping';
-      return done(COLORS.ok,
-        `✅ **${entry.display}** added on ${p}\n📢 Channel: <#${channel.id}>\n🔔 Ping: ${ping}\n⏱️ Checked every 30 seconds`);
+      let text = `**${entry.display}** is now tracked on ${p}\n📢 Channel: <#${channel.id}>\n🔔 Ping: ${ping}\n⏱️ Checked every 30 seconds`;
+      text += `\n\n${r0 ? statusLine(r0) : `⚠️ ${errors[0] || 'Could not check right now — it will be retried automatically.'}`}`;
+      await say(i, COLORS.ok, '✅ Streamer added', text);
+      return true;
     }
 
-    /* ── /kick | /youtube → remove | disable | recheck ── */
-    const sub = i.options.getSubcommand(false);
-    if (!sub) {
-      return reply(i, COLORS.err, '⚠️ This command is outdated. Please restart Discord (Ctrl+R) and try again.');
+    /* remove | disable */
+    if (action === 'remove' || action === 'disable') {
+      const input = i.options.getString('user', true);
+      const entry = await findEntry(i.guildId, platform, input);
+      if (!entry) { await say(i, COLORS.err, '❌ Not tracked', `**${input}** isn't being tracked on ${p}. Try \`/${platform}list\`.`); return true; }
+      if (action === 'remove') {
+        db = db.filter(e => e !== entry); save();
+        await say(i, COLORS.ok, '🗑️ Removed', `**${entry.display}** was removed from ${p} alerts.`, { ephemeral: false });
+      } else {
+        entry.enabled = false; save();
+        await say(i, COLORS.off, '⏸️ Disabled', `Alerts for **${entry.display}** on ${p} are paused.\nRun \`/${platform}add\` again to turn them back on.`, { ephemeral: false });
+      }
+      return true;
     }
 
-    // recheck
-    if (sub === 'recheck') {
-      await i.deferReply({ flags: MessageFlags.Ephemeral });
+    /* list */
+    if (action === 'list') {
+      const list = db.filter(e => e.guildId === i.guildId && e.platform === platform);
+      if (!list.length) { await say(i, COLORS.off, `📺 ${p} streamers`, `Nobody added yet. Use \`/${platform}add\`.`); return true; }
+      const lines = list.map(e => {
+        const icon = !e.enabled ? '⏸️' : e.live ? '🔴' : '⚫';
+        const ping = pingText(e.pingRoleId, e.guildId);
+        return `${icon} **${e.display}** → <#${e.discordChannelId}>${ping ? ` · pings ${ping}` : ''}${e.enabled ? '' : ' · disabled'}`;
+      });
+      await say(i, COLORS[platform], `📺 ${p} streamers (${list.length})`, lines.join('\n'));
+      return true;
+    }
+
+    /* recheck */
+    if (action === 'recheck') {
+      await i.deferReply({ ephemeral: true });
       const input = i.options.getString('user');
       const force = i.options.getBoolean('force') ?? false;
       let list = db.filter(e => e.guildId === i.guildId && e.platform === platform);
-
       if (input) {
-        const key = await resolveKey(i.guildId, platform, input);
-        list = list.filter(e => e.username === key);
-        if (!list.length) {
-          return i.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.err)
-            .setDescription(`❌ **${input}** isn't being tracked on ${p}.`)] });
-        }
+        const entry = await findEntry(i.guildId, platform, input);
+        if (!entry) return await say(i, COLORS.err, '❌ Not tracked', `**${input}** isn't being tracked on ${p}.`), true;
+        list = [entry];
       }
-      if (!list.length) {
-        return i.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.off)
-          .setDescription(`No ${p} streamers added yet. Use \`/${platform}add\` first.`)] });
-      }
+      if (!list.length) { await say(i, COLORS.off, `${p} recheck`, `No ${p} streamers added yet. Use \`/${platform}add\` first.`); return true; }
 
       const paused = list.filter(e => !e.enabled);
       const { results, errors } = await runExclusive(list.filter(e => e.enabled), force);
-
       const lines = [
-        ...results.map(r => {
-          const name = `**${r.entry.display}**`;
-          if (!r.live) return `⚫ ${name} — offline`;
-          if (r.error) return `⚠️ ${name} — live, but the announcement FAILED: ${r.error}\n   ↳ Check the bot's permissions in <#${r.entry.channelId}> (View Channel, Send Messages, Embed Links)`;
-          return r.announced ? `🔴 ${name} — live · announcement sent` : `🔴 ${name} — live · already announced`;
-        }),
+        ...results.map(statusLine),
         ...paused.map(e => `⏸️ **${e.display}** — disabled`),
         ...errors.map(e => `⚠️ ${e}`),
       ];
-      return i.editReply({ embeds: [new EmbedBuilder()
-        .setColor(COLORS[platform])
-        .setTitle(`${p} recheck`)
-        .setDescription(lines.join('\n') || 'Nothing to check.')
-        .setFooter({ text: 'Only new streams get announced — no duplicates' })
-        .setTimestamp()] });
-    }
-
-    // remove | disable
-    const input = i.options.getString('user', true);
-    const key = await resolveKey(i.guildId, platform, input);
-    const entry = find(i.guildId, platform, key);
-    if (!entry) return reply(i, COLORS.err, `❌ **${input}** isn't being tracked on ${p}.`);
-
-    if (sub === 'remove') {
-      db = db.filter(e => e !== entry); save();
-      return reply(i, COLORS.ok, `🗑️ Removed **${entry.display}** from ${p} alerts.`);
-    }
-    entry.enabled = false; save();
-    return reply(i, COLORS.off, `⏸️ Alerts for **${entry.display}** on ${p} are disabled.\nRe-run \`/${platform}add\` to turn them back on.`);
-  } catch (err) {
-    console.error(err);
-    const payload = { embeds: [new EmbedBuilder().setColor(COLORS.err).setDescription('⚠️ Something went wrong. Please try again.')] };
-    if (i.deferred || i.replied) i.editReply(payload).catch(() => {});
-    else i.reply({ ...payload, flags: MessageFlags.Ephemeral }).catch(() => {});
-  }
-});
-
-async function registerCommands() {
-  try {
-    await client.application.commands.set([]); // clear global copies (prevents duplicates)
-    for (const guild of client.guilds.cache.values()) {
-      await guild.commands.set(commands);
-      console.log(`✅ Registered ${commands.length} commands in ${guild.name}`);
+      await say(i, COLORS[platform], `${p} recheck${force ? ' (forced)' : ''}`,
+        (lines.join('\n') || 'Nothing to check.') + `\n\n*${force ? 'Forced: re-sent for live streamers' : 'Only new streams get announced — no duplicates'}*`);
+      return true;
     }
   } catch (err) {
-    console.error('❌ Command registration failed:', err);
+    console.error('streams command error:', err);
+    await say(i, COLORS.err, '⚠️ Something went wrong', err.message ? `\`${trunc(err.message, 300)}\`` : 'Please try again.').catch(() => {});
   }
+  return true;
 }
 
-client.once(Events.ClientReady, async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  await registerCommands();
-  poll();
-  setInterval(poll, POLL_MS);
-});
+/* ───────────── lifecycle ───────────── */
+function start(discordClient) {
+  client = discordClient;
+  if (!env('KICK_CLIENT_ID') || !env('KICK_CLIENT_SECRET')) console.warn('📺 streams: KICK_CLIENT_ID/KICK_CLIENT_SECRET not set — Kick alerts will fail.');
+  if (!env('YOUTUBE_API_KEY')) console.warn('📺 streams: YOUTUBE_API_KEY not set — YouTube alerts will fail.');
+  poll().catch(e => console.error('streams poll:', e));
+  setInterval(() => poll().catch(e => console.error('streams poll:', e)), POLL_MS);
+  console.log(`📺 streams: polling every ${POLL_MS / 1000}s · ${db.length} streamer(s) loaded from ${DB_FILE}`);
+}
+function forgetGuild(guildId) {
+  const before = db.length;
+  db = db.filter(e => e.guildId !== guildId);
+  if (db.length !== before) save();
+}
 
-// register instantly when the bot is added to a new server
-client.on(Events.GuildCreate, guild =>
-  guild.commands.set(commands).catch(console.error));
-
-// Tiny HTTP server so Render Web Services stay healthy (skip if using a Background Worker)
-if (process.env.PORT) require('http').createServer((_, r) => r.end('ok')).listen(process.env.PORT);
-
-client.login(DISCORD_TOKEN);
+module.exports = { commands, handle, start, forgetGuild, _internals: { checkEntries, runExclusive, handleState, pingText, db: () => db } };
