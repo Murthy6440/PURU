@@ -545,7 +545,7 @@ const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => { res.writeHead(200); res.end('PURNIMA online'); })
   .listen(PORT, () => console.log(`🌐 Health server on port ${PORT}`));
 
-client = new Client({ intents: [GatewayIntentBits.Guilds] });
+client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
 async function registerCommands(c) {
   try {
@@ -564,6 +564,24 @@ client.once(Events.ClientReady, async c => {
   c.user.setPresence({ activities: [{ name: 'live streams | /kickadd', type: ActivityType.Watching }], status: 'online' });
   await registerCommands(c);
   start(c);
+});
+
+// ── "I'm busy" auto-reply: when anyone @mentions this user, the bot answers for them ──
+const BUSY_USER_ID = process.env.BUSY_USER_ID || '1247224586911617105';
+const BUSY_MESSAGE = process.env.BUSY_MESSAGE || "I'm currently busy, talk to you later. 🙏";
+const BUSY_COOLDOWN_MS = 10_000; // max one auto-reply per channel every 10s, so a spam of mentions can't flood the chat
+const busyLast = new Map();
+client.on(Events.MessageCreate, async message => {
+  try {
+    if (message.author.bot || !message.guild) return;
+    if (message.author.id === BUSY_USER_ID) return;                // they can mention themselves in peace
+    if (!message.mentions.users.has(BUSY_USER_ID)) return;         // only direct @user mentions (not @everyone / roles)
+    const last = busyLast.get(message.channelId) || 0;
+    if (Date.now() - last < BUSY_COOLDOWN_MS) return;
+    busyLast.set(message.channelId, Date.now());
+    const payload = { content: BUSY_MESSAGE, allowedMentions: { parse: [], repliedUser: false } };
+    await message.reply(payload).catch(() => message.channel.send({ content: BUSY_MESSAGE, allowedMentions: { parse: [] } }));
+  } catch (err) { console.error('Busy auto-reply error:', err.message); }
 });
 
 client.on(Events.InteractionCreate, i => { handle(i).catch(err => console.error('Interaction error:', err)); });
