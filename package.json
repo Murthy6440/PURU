@@ -1,8 +1,12 @@
 {
-  "name": "live-announcer",
+  "name": "purnima-live-bot",
   "version": "1.0.0",
   "main": "bot.js",
+  "license": "UNLICENSED",
   "scripts": { "start": "node bot.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "discord.js": "^14.16.0" }
+  "engines": { "node": "20.x" },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.5"
+  }
 }
