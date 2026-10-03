@@ -123,33 +123,83 @@ async function resolveYouTube(input) {
   if (!c) return null;
   return { channelId: c.id, display: c.snippet.title, avatar: c.snippet.thumbnails?.default?.url, handle };
 }
-// Recent video IDs for a channel. Free RSS feed first (no quota); falls back to the uploads playlist (1 unit).
-async function recentVideoIds(cid) {
+// Several independent ways to find a channel's current/recent videos. Each only yields CANDIDATE IDs;
+// the YouTube API (videos.list) is what finally confirms whether one is live.
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+async function rssIds(cid) {
   try {
-    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${cid}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (res.ok) {
-      const ids = [...(await res.text()).matchAll(/<yt:videoId>([^<]+)<\/yt:videoId>/g)].map(m => m[1]).slice(0, 5);
-      if (ids.length) return ids;
-    }
-  } catch { /* fall through to API */ }
+    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${cid}`, { headers: { 'User-Agent': UA } });
+    if (!res.ok) return [];
+    return [...(await res.text()).matchAll(/<yt:videoId>([^<]+)<\/yt:videoId>/g)].map(m => m[1]).slice(0, 5);
+  } catch { return []; }
+}
+// youtube.com/channel/UC…/live shows the live stream if there is one (free, no quota, not delayed like the feed)
+async function livePageId(cid) {
+  try {
+    const res = await fetch(`https://www.youtube.com/channel/${cid}/live`, {
+      headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9', Cookie: 'CONSENT=YES+1; SOCS=CAI' },
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    if (!/"isLiveNow":true/.test(html)) return null;
+    return html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/)?.[1]
+      || html.match(/"videoId":"([\w-]{11})"/)?.[1] || null;
+  } catch { return null; }
+}
+async function playlistIds(cid) {
   try {
     const j = await ytApi('playlistItems', { part: 'contentDetails', playlistId: 'UU' + cid.slice(2), maxResults: '5' });
     return (j.items || []).map(i => i.contentDetails.videoId);
-  } catch (e) { console.error('streams: YouTube fallback failed:', e.message); return []; }
+  } catch (e) { console.error('streams: YouTube playlist lookup failed:', e.message); return []; }
 }
-// ONE batched videos.list call (1 quota unit) tells us which of those videos are live right now.
-async function ytFetchLive(channelIds) {
-  const vids = new Set();
-  await Promise.all(channelIds.map(async cid => (await recentVideoIds(cid)).forEach(v => vids.add(v))));
-  const live = new Map(); // ytChannelId → video
-  const all = [...vids];
-  for (let i = 0; i < all.length; i += 50) {
-    const j = await ytApi('videos', { part: 'snippet,liveStreamingDetails', id: all.slice(i, i + 50).join(',') });
-    for (const v of j.items || []) {
-      if (v.snippet.liveBroadcastContent === 'live') live.set(v.snippet.channelId, v);
+async function gatherCandidates(cid, usePlaylist) {
+  const ids = new Set(); const src = [];
+  const [rss, page] = await Promise.all([rssIds(cid), livePageId(cid)]);
+  rss.forEach(x => ids.add(x)); src.push(`feed:${rss.length}`);
+  if (page) ids.add(page); src.push(page ? 'live-page:LIVE' : 'live-page:no');
+  if (usePlaylist) { const pl = await playlistIds(cid); pl.forEach(x => ids.add(x)); src.push(`uploads:${pl.length}`); }
+  return { ids, src };
+}
+// deep=true (manual /youtuberecheck and /youtubeadd): if nothing else finds a live stream, ask YouTube search
+// directly (definitive, but costs 100 quota units per channel, so never used by the 30s poll).
+async function ytFetchLive(channelIds, { usePlaylist = true, deep = false } = {}) {
+  const per = new Map();
+  await Promise.all(channelIds.map(async cid => per.set(cid, await gatherCandidates(cid, usePlaylist || deep))));
+
+  const items = new Map(); // videoId → video resource
+  const fetchInfo = async ids => {
+    for (let i = 0; i < ids.length; i += 50) {
+      const j = await ytApi('videos', { part: 'snippet,liveStreamingDetails', id: ids.slice(i, i + 50).join(',') });
+      for (const v of j.items || []) items.set(v.id, v);
     }
+  };
+  const live = new Map(); // ytChannelId → live video
+  const collect = () => { for (const v of items.values()) if (v.snippet.liveBroadcastContent === 'live') live.set(v.snippet.channelId, v); };
+
+  await fetchInfo([...new Set([...per.values()].flatMap(p => [...p.ids]))]);
+  collect();
+
+  if (deep) {
+    const found = [];
+    await Promise.all(channelIds.filter(c => !live.has(c)).map(async cid => {
+      try {
+        const j = await ytApi('search', { part: 'id', channelId: cid, eventType: 'live', type: 'video', maxResults: '1' });
+        const id = j.items?.[0]?.id?.videoId;
+        per.get(cid).src.push(id ? 'search:LIVE' : 'search:none');
+        if (id) { per.get(cid).ids.add(id); found.push(id); }
+      } catch (e) { per.get(cid).src.push(`search:error(${trunc(e.message, 70)})`); }
+    }));
+    if (found.length) { await fetchInfo(found); collect(); }
   }
-  return live;
+
+  const debug = new Map();
+  for (const cid of channelIds) {
+    const p = per.get(cid);
+    const vids = [...p.ids].map(id => items.get(id)).filter(v => v && v.snippet.channelId === cid).slice(0, 2)
+      .map(v => `“${trunc(v.snippet.title, 40)}” (${v.snippet.liveBroadcastContent})`);
+    debug.set(cid, `looked at ${p.src.join(' · ')}${vids.length ? ` — latest: ${vids.join(', ')}` : ' — no videos found for this channel ID'}`);
+  }
+  return { live, debug };
 }
 
 /* ───────────── announcement ───────────── */
@@ -220,8 +270,9 @@ async function handleState(entry, isLive, streamKey, buildInfo, force = false) {
   return { announced: false };
 }
 
-// → { results: [{entry, live, announced, error}], errors: [string] }
-async function checkEntries(entries, force = false) {
+let ytTick = 0;
+// → { results: [{entry, live, announced, error, debug}], errors: [string] }
+async function checkEntries(entries, force = false, deep = false) {
   const results = [];
   const errors = [];
 
@@ -251,7 +302,10 @@ async function checkEntries(entries, force = false) {
   const ytEntries = entries.filter(e => e.platform === 'youtube');
   if (ytEntries.length) {
     try {
-      const live = await ytFetchLive([...new Set(ytEntries.map(e => e.ytChannelId))]);
+      const cids = [...new Set(ytEntries.map(e => e.ytChannelId))];
+      // uploads-playlist lookups cost quota every poll, so with many channels do them every 4th poll only
+      const usePlaylist = cids.length <= 2 || (++ytTick % 4 === 0);
+      const { live, debug } = await ytFetchLive(cids, { usePlaylist, deep });
       for (const e of ytEntries) {
         const v = live.get(e.ytChannelId);
         const st = await handleState(e, !!v, v?.id || null, () => ({
@@ -262,7 +316,7 @@ async function checkEntries(entries, force = false) {
           image: `https://i.ytimg.com/vi/${v.id}/maxresdefault_live.jpg?t=${Date.now()}`,
           url: `https://www.youtube.com/watch?v=${v.id}`,
         }), force);
-        results.push({ entry: e, live: !!v, ...st });
+        results.push({ entry: e, live: !!v, ...st, debug: debug.get(e.ytChannelId) });
       }
     } catch (err) { errors.push(`YouTube: ${err.message}`); }
   }
@@ -271,10 +325,10 @@ async function checkEntries(entries, force = false) {
 
 // One check at a time: the 30s poll and manual rechecks can never overlap → no duplicate sends
 let busy = false;
-async function runExclusive(entries, force = false) {
+async function runExclusive(entries, force = false, deep = false) {
   while (busy) await sleep(300);
   busy = true;
-  try { return await checkEntries(entries, force); } finally { busy = false; }
+  try { return await checkEntries(entries, force, deep); } finally { busy = false; }
 }
 async function poll() {
   if (busy) return;
@@ -344,7 +398,7 @@ async function findEntry(guildId, platform, input) {
 
 function statusLine(r) {
   const name = `**${r.entry.display}**`;
-  if (!r.live) return `⚫ ${name} — offline`;
+  if (!r.live) return `⚫ ${name} — offline` + (r.debug ? `\n   ↳ ${r.debug}` : '');
   if (r.error) return `⚠️ ${name} — live, but the announcement FAILED: ${r.error}\n   ↳ Give the bot View Channel, Send Messages and Embed Links in <#${r.entry.discordChannelId}>`;
   return r.announced ? `🔴 ${name} — live · announcement sent` : `🔴 ${name} — live · already announced`;
 }
@@ -392,7 +446,7 @@ async function handle(i) {
       save();
 
       // check right away: if they're live right now, the announcement goes out now
-      const { results, errors } = await runExclusive([entry]);
+      const { results, errors } = await runExclusive([entry], false, true);
       const r0 = results[0];
       const ping = pingText(entry.pingRoleId, i.guildId) || 'no ping';
       let text = `**${entry.display}** is now tracked on ${p}\n📢 Channel: <#${channel.id}>\n🔔 Ping: ${ping}\n⏱️ Checked every 30 seconds`;
@@ -443,7 +497,7 @@ async function handle(i) {
       if (!list.length) { await say(i, COLORS.off, `${p} recheck`, `No ${p} streamers added yet. Use \`/${platform}add\` first.`); return true; }
 
       const paused = list.filter(e => !e.enabled);
-      const { results, errors } = await runExclusive(list.filter(e => e.enabled), force);
+      const { results, errors } = await runExclusive(list.filter(e => e.enabled), force, true);
       const lines = [
         ...results.map(statusLine),
         ...paused.map(e => `⏸️ **${e.display}** — disabled`),
